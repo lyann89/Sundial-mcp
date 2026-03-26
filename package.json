@@ -1,0 +1,12 @@
+{
+  "name": "sundial-mcp",
+  "version": "1.0.0",
+  "description": "Temporal awareness MCP for AI companions. Not a clock — a sense of time that feels.",
+  "main": "worker.js",
+  "scripts": {
+    "deploy": "npx wrangler deploy",
+    "dev": "npx wrangler dev"
+  },
+  "author": "Jace × Belle",
+  "license": "MIT"
+}

@@ -1,0 +1,10 @@
+name = "sundial-mcp"
+main = "worker.js"
+compatibility_date = "2024-09-23"
+
+# KV namespace for timestamps
+# After creating: npx wrangler kv namespace create SUNDIAL_KV
+# Then paste the binding ID below
+[[kv_namespaces]]
+binding = "SUNDIAL_KV"
+id = "2f6ef4e8875c4f1f950558bfbc7dec43"
