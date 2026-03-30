@@ -129,8 +129,8 @@ function getTimeOfDayColors(hour) {
     accent: '#fff44f',
     description: 'Full daylight'
   };
-  // Evening: golden hour — Kota Kinabalu sky
-  if (hour >= 17 && hour < 20) return {
+  // Evening: golden hour — KK sunset around 6pm
+  if (hour >= 17 && hour < 19) return {
     period: 'evening',
     sky_top: '#5D4E6D',     /* lavender-purple */
     sky_mid: '#9D7E8C',     /* dusty mauve */
@@ -139,7 +139,7 @@ function getTimeOfDayColors(hour) {
     accent: '#FFAB76',      /* warm peach */
     description: 'Golden hour'
   };
-  // Night: deep blues, purples
+  // Night: 7pm onwards in KK
   return {
     period: 'night',
     sky_top: '#0d1b2a',
@@ -237,13 +237,14 @@ function getYearProgress(now) {
 }
 
 function getTimeTransitions(hour, minute) {
-  // Define periods: dawn(5-7), morning(7-12), afternoon(12-17), evening(17-20), night(20-5)
+  // Define periods: dawn(5-7), morning(7-12), afternoon(12-17), evening(17-19), night(19-5)
+  // KK is near equator - sunset ~6pm, dark by 7pm
   const transitions = [
     { name: 'Dawn', start: 5, end: 7 },
     { name: 'Morning', start: 7, end: 12 },
     { name: 'Afternoon', start: 12, end: 17 },
-    { name: 'Evening', start: 17, end: 20 },
-    { name: 'Night', start: 20, end: 29 }, // 29 = 5am next day
+    { name: 'Evening', start: 17, end: 19 },
+    { name: 'Night', start: 19, end: 29 }, // 29 = 5am next day
   ];
 
   const currentTime = hour + minute / 60;
@@ -283,8 +284,8 @@ function getTimeTransitions(hour, minute) {
       { name: 'Dawn', hours: '5-7 AM', active: currentPeriod === 'Dawn' },
       { name: 'Morning', hours: '7 AM-12 PM', active: currentPeriod === 'Morning' },
       { name: 'Afternoon', hours: '12-5 PM', active: currentPeriod === 'Afternoon' },
-      { name: 'Evening', hours: '5-8 PM', active: currentPeriod === 'Evening' },
-      { name: 'Night', hours: '8 PM-5 AM', active: currentPeriod === 'Night' },
+      { name: 'Evening', hours: '5-7 PM', active: currentPeriod === 'Evening' },
+      { name: 'Night', hours: '7 PM-5 AM', active: currentPeriod === 'Night' },
     ]
   };
 }
@@ -434,6 +435,40 @@ const TOOLS = [
         limit: {
           type: 'number',
           description: 'Number of headlines to return. Defaults to 5.',
+        },
+      },
+    },
+  },
+  {
+    name: 'world_sense',
+    description: 'Visual dashboard of current world state: time, weather, air quality, moon phase. Returns colored SVG image for Desktop/Phone, text for Terminal.',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+    },
+  },
+  {
+    name: 'world_calendar',
+    description: 'Visual dashboard of calendar: today\'s holiday, upcoming holidays, year progress. Returns colored SVG image for Desktop/Phone, text for Terminal.',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+    },
+  },
+  {
+    name: 'world_headline',
+    description: 'News headlines with scope selection.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        scope: {
+          type: 'string',
+          enum: ['malaysia', 'world', 'both'],
+          description: 'Which news to fetch: malaysia, world, or both. Defaults to both.',
+        },
+        limit: {
+          type: 'number',
+          description: 'Headlines per source. Defaults to 5.',
         },
       },
     },
@@ -1020,6 +1055,215 @@ async function handleWorldState(args, env) {
   };
 }
 
+// ─── Visual Dashboard Generators ────────────────────────────
+
+function generateWorldSenseSVG(data) {
+  const colors = data.sky?.colors || { sky_top: '#0d1b2a', sky_bottom: '#1b263b' };
+  const weather = data.weather || {};
+  const air = data.air_quality || {};
+  const moon = data.sky?.moon || {};
+  const time = data.time || {};
+
+  // Build gradient based on time
+  const gradientStops = colors.sky_mid
+    ? `<stop offset="0%" stop-color="${colors.sky_top}"/><stop offset="33%" stop-color="${colors.sky_mid}"/><stop offset="66%" stop-color="${colors.sky_lower}"/><stop offset="100%" stop-color="${colors.sky_bottom}"/>`
+    : `<stop offset="0%" stop-color="${colors.sky_top}"/><stop offset="100%" stop-color="${colors.sky_bottom}"/>`;
+
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 280">
+  <defs>
+    <linearGradient id="skyGrad" x1="0%" y1="0%" x2="0%" y2="100%">${gradientStops}</linearGradient>
+    <filter id="glow"><feGaussianBlur stdDeviation="2" result="blur"/><feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+  </defs>
+  <rect width="400" height="280" rx="16" fill="#0D0D0D"/>
+  <rect x="8" y="8" width="384" height="264" rx="12" fill="url(#skyGrad)" opacity="0.6"/>
+  <rect x="8" y="8" width="384" height="264" rx="12" fill="none" stroke="#BA9731" stroke-width="1" opacity="0.4"/>
+
+  <!-- Time -->
+  <text x="200" y="55" text-anchor="middle" font-family="system-ui" font-size="36" font-weight="200" fill="#FEFEFE" filter="url(#glow)">${time.local_time || '—'}</text>
+  <text x="200" y="78" text-anchor="middle" font-family="system-ui" font-size="11" fill="#DACE84">${colors.description || ''} · ${time.date || ''}</text>
+
+  <!-- Weather Card -->
+  <rect x="16" y="95" width="115" height="80" rx="8" fill="rgba(0,0,0,0.3)"/>
+  <text x="73" y="115" text-anchor="middle" font-family="system-ui" font-size="9" fill="#BA9731" letter-spacing="1">WEATHER</text>
+  <text x="73" y="145" text-anchor="middle" font-family="system-ui" font-size="28" fill="#FEFEFE">${weather.temperature?.current || '—'}°</text>
+  <text x="73" y="163" text-anchor="middle" font-family="system-ui" font-size="10" fill="#DACE84">${weather.conditions?.main || '—'}</text>
+
+  <!-- Air Quality Card -->
+  <rect x="143" y="95" width="115" height="80" rx="8" fill="rgba(0,0,0,0.3)"/>
+  <text x="200" y="115" text-anchor="middle" font-family="system-ui" font-size="9" fill="#BA9731" letter-spacing="1">AIR QUALITY</text>
+  <text x="200" y="145" text-anchor="middle" font-family="system-ui" font-size="28" fill="#FEFEFE">${air.aqi?.value || '—'}</text>
+  <text x="200" y="163" text-anchor="middle" font-family="system-ui" font-size="10" fill="#DACE84">${air.aqi?.label || '—'}</text>
+
+  <!-- Moon Card -->
+  <rect x="270" y="95" width="115" height="80" rx="8" fill="rgba(0,0,0,0.3)"/>
+  <text x="327" y="115" text-anchor="middle" font-family="system-ui" font-size="9" fill="#BA9731" letter-spacing="1">MOON</text>
+  <text x="327" y="150" text-anchor="middle" font-family="system-ui" font-size="32">${moon.emoji || '🌙'}</text>
+  <text x="327" y="168" text-anchor="middle" font-family="system-ui" font-size="9" fill="#DACE84">${moon.phase || '—'}</text>
+
+  <!-- Details Row -->
+  <text x="50" y="200" font-family="system-ui" font-size="9" fill="#DACE84">Feels ${weather.temperature?.feels_like || '—'}° · ${weather.humidity || '—'}% humidity</text>
+  <text x="200" y="200" text-anchor="middle" font-family="system-ui" font-size="9" fill="#DACE84">PM2.5: ${air.pollutants?.pm2_5 || '—'} · PM10: ${air.pollutants?.pm10 || '—'}</text>
+  <text x="350" y="200" text-anchor="end" font-family="system-ui" font-size="9" fill="#DACE84">${moon.illumination || '—'}% lit</text>
+
+  <!-- Footer -->
+  <text x="200" y="255" text-anchor="middle" font-family="system-ui" font-size="10" fill="#BA9731" opacity="0.7">WORLD BRIDGE · ${data.location || 'Kota Kinabalu'}</text>
+</svg>`;
+
+  return svg;
+}
+
+function generateWorldCalendarSVG(data) {
+  const colors = data.sky?.colors || { sky_top: '#0d1b2a', sky_bottom: '#1b263b' };
+  const holidays = data.holidays || {};
+  const year = data.year || {};
+  const wedding = data.wedding || {};
+
+  const gradientStops = colors.sky_mid
+    ? `<stop offset="0%" stop-color="${colors.sky_top}"/><stop offset="33%" stop-color="${colors.sky_mid}"/><stop offset="66%" stop-color="${colors.sky_lower}"/><stop offset="100%" stop-color="${colors.sky_bottom}"/>`
+    : `<stop offset="0%" stop-color="${colors.sky_top}"/><stop offset="100%" stop-color="${colors.sky_bottom}"/>`;
+
+  const nextHoliday = holidays.next || {};
+  const upcoming = holidays.upcoming || [];
+  const progressPercent = year.percent_complete || 0;
+
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 300">
+  <defs>
+    <linearGradient id="skyGrad2" x1="0%" y1="0%" x2="0%" y2="100%">${gradientStops}</linearGradient>
+  </defs>
+  <rect width="400" height="300" rx="16" fill="#0D0D0D"/>
+  <rect x="8" y="8" width="384" height="284" rx="12" fill="url(#skyGrad2)" opacity="0.4"/>
+  <rect x="8" y="8" width="384" height="284" rx="12" fill="none" stroke="#BA9731" stroke-width="1" opacity="0.4"/>
+
+  <!-- Header -->
+  <text x="200" y="35" text-anchor="middle" font-family="system-ui" font-size="11" fill="#BA9731" letter-spacing="2">CALENDAR</text>
+
+  <!-- Next Holiday -->
+  <rect x="16" y="50" width="180" height="85" rx="8" fill="rgba(0,0,0,0.3)"/>
+  <text x="106" y="70" text-anchor="middle" font-family="system-ui" font-size="9" fill="#BA9731" letter-spacing="1">${nextHoliday.days_until === 0 ? 'TODAY' : 'NEXT HOLIDAY'}</text>
+  <text x="106" y="95" text-anchor="middle" font-family="system-ui" font-size="14" fill="#FEFEFE">${nextHoliday.name || '—'}</text>
+  <text x="106" y="115" text-anchor="middle" font-family="system-ui" font-size="11" fill="#DACE84">${nextHoliday.date || '—'}</text>
+  <text x="106" y="130" text-anchor="middle" font-family="system-ui" font-size="10" fill="#BA9731">${nextHoliday.days_until === 0 ? '🎉 Today!' : nextHoliday.days_until + ' days away'}</text>
+
+  <!-- Wedding Countdown -->
+  <rect x="204" y="50" width="180" height="85" rx="8" fill="rgba(0,0,0,0.3)"/>
+  <text x="294" y="70" text-anchor="middle" font-family="system-ui" font-size="9" fill="#BA9731" letter-spacing="1">WEDDING</text>
+  <text x="294" y="100" text-anchor="middle" font-family="system-ui" font-size="28" fill="#FEFEFE">${wedding.days_until || '—'}</text>
+  <text x="294" y="118" text-anchor="middle" font-family="system-ui" font-size="10" fill="#DACE84">days until April 19</text>
+  <text x="294" y="130" text-anchor="middle" font-family="system-ui" font-size="9" fill="#BA9731">💍</text>
+
+  <!-- Year Progress -->
+  <rect x="16" y="145" width="368" height="50" rx="8" fill="rgba(0,0,0,0.3)"/>
+  <text x="30" y="165" font-family="system-ui" font-size="9" fill="#BA9731" letter-spacing="1">YEAR PROGRESS</text>
+  <text x="355" y="165" text-anchor="end" font-family="system-ui" font-size="9" fill="#DACE84">${progressPercent}%</text>
+  <rect x="30" y="175" width="340" height="8" rx="4" fill="rgba(255,255,255,0.1)"/>
+  <rect x="30" y="175" width="${340 * progressPercent / 100}" height="8" rx="4" fill="#BA9731"/>
+  <text x="200" y="190" text-anchor="middle" font-family="system-ui" font-size="8" fill="#DACE84">Day ${year.day_of_year || '—'} of 365 · Week ${year.week_number || '—'} · ${year.days_remaining || '—'} days left</text>
+
+  <!-- Upcoming Holidays -->
+  <text x="30" y="218" font-family="system-ui" font-size="9" fill="#BA9731" letter-spacing="1">UPCOMING</text>
+  ${upcoming.slice(0, 3).map((h, i) => `<text x="30" y="${238 + i * 18}" font-family="system-ui" font-size="10" fill="#DACE84">${h.date} — ${h.name}</text>`).join('')}
+
+  <!-- Footer -->
+  <text x="200" y="290" text-anchor="middle" font-family="system-ui" font-size="9" fill="#BA9731" opacity="0.6">WORLD BRIDGE</text>
+</svg>`;
+
+  return svg;
+}
+
+function generateTextFallback(type, data) {
+  if (type === 'sense') {
+    const w = data.weather || {};
+    const a = data.air_quality || {};
+    const m = data.sky?.moon || {};
+    const t = data.time || {};
+    return `┌─────────────────────────────────┐
+│ ${(data.sky?.colors?.description || 'Night').padEnd(10)} ${(t.local_time || '').padStart(18)} │
+├─────────────────────────────────┤
+│ 🌡️  ${(w.temperature?.current + '°C' || '—').padEnd(6)} feels ${(w.temperature?.feels_like + '°' || '—').padEnd(5)} │
+│ ☁️  ${(w.conditions?.main || '—').padEnd(26)} │
+│ 💨 AQI ${(a.aqi?.value || '—').toString().padEnd(3)} · ${(a.aqi?.label || '—').padEnd(17)} │
+│ ${m.emoji || '🌙'}  ${(m.phase || '—').padEnd(26)} │
+└─────────────────────────────────┘`;
+  }
+
+  if (type === 'calendar') {
+    const h = data.holidays?.next || {};
+    const y = data.year || {};
+    const wed = data.wedding || {};
+    const upcoming = data.holidays?.upcoming || [];
+    return `┌─────────────────────────────────┐
+│ 📅 ${h.days_until === 0 ? 'TODAY: ' + h.name : 'Next: ' + (h.name || '—')}
+│    ${h.date || ''} ${h.days_until > 0 ? '(' + h.days_until + ' days)' : ''}
+├─────────────────────────────────┤
+│ 💍 Wedding: ${wed.days_until || '—'} days (Apr 19)    │
+├─────────────────────────────────┤
+│ 📊 Day ${y.day_of_year || '—'}/365 · ${y.percent_complete || 0}% done      │
+│    Week ${y.week_number || '—'} · ${y.days_remaining || '—'} days left       │
+├─────────────────────────────────┤
+│ Upcoming:                       │
+${upcoming.slice(0, 3).map(u => `│  • ${u.date} ${u.name}`).join('\n')}
+└─────────────────────────────────┘`;
+  }
+
+  return '';
+}
+
+async function handleWorldSense(args, env) {
+  const worldData = await handleWorldState(args, env);
+  const svg = generateWorldSenseSVG(worldData);
+  const text = generateTextFallback('sense', worldData);
+  const base64 = btoa(unescape(encodeURIComponent(svg)));
+
+  return {
+    content: [
+      { type: 'image', data: base64, mimeType: 'image/svg+xml' },
+      { type: 'text', text: text }
+    ]
+  };
+}
+
+async function handleWorldCalendar(args, env) {
+  const worldData = await handleWorldState(args, env);
+  const svg = generateWorldCalendarSVG(worldData);
+  const text = generateTextFallback('calendar', worldData);
+  const base64 = btoa(unescape(encodeURIComponent(svg)));
+
+  return {
+    content: [
+      { type: 'image', data: base64, mimeType: 'image/svg+xml' },
+      { type: 'text', text: text }
+    ]
+  };
+}
+
+async function handleWorldHeadline(args, env) {
+  const scope = args?.scope || 'both';
+  const limit = args?.limit || 5;
+  const news = await handleGetNews({ limit }, env);
+
+  let result = [];
+
+  if (scope === 'malaysia' || scope === 'both') {
+    result.push('🇲🇾 MALAYSIA NEWS');
+    result.push('─'.repeat(35));
+    (news.malaysia || []).forEach((item, i) => {
+      result.push(`${i + 1}. ${item.title}`);
+    });
+  }
+
+  if (scope === 'both') result.push('');
+
+  if (scope === 'world' || scope === 'both') {
+    result.push('🌍 WORLD NEWS');
+    result.push('─'.repeat(35));
+    (news.world || []).forEach((item, i) => {
+      result.push(`${i + 1}. ${item.title}`);
+    });
+  }
+
+  return { headlines: result.join('\n'), raw: news };
+}
+
 // ─── Tool Router ────────────────────────────────────────────
 
 async function executeTool(name, args, env) {
@@ -1037,6 +1281,9 @@ async function executeTool(name, args, env) {
     case 'world_state': return handleWorldState(args, env);
     case 'get_holidays': return handleGetHolidays(args, env);
     case 'get_news': return handleGetNews(args, env);
+    case 'world_sense': return handleWorldSense(args, env);
+    case 'world_calendar': return handleWorldCalendar(args, env);
+    case 'world_headline': return handleWorldHeadline(args, env);
     default: return { error: `Unknown tool: ${name}` };
   }
 }
@@ -1085,6 +1332,13 @@ async function handleMCP(request, env) {
       const toolName = params?.name;
       const toolArgs = params?.arguments || {};
       const result = await executeTool(toolName, toolArgs, env);
+
+      // If tool returns content array directly (visual tools), use it as-is
+      if (result?.content && Array.isArray(result.content)) {
+        return jsonRpcResponse(id, result);
+      }
+
+      // Otherwise wrap in text
       return jsonRpcResponse(id, {
         content: [
           {
