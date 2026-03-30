@@ -174,22 +174,118 @@ function getMoonPhase(date) {
   const phase = jd / 29.53058867; // Synodic month
   const dayInCycle = (phase - Math.floor(phase)) * 29.53;
 
-  let phaseName, emoji;
-  if (dayInCycle < 1.85) { phaseName = 'New Moon'; emoji = '🌑'; }
-  else if (dayInCycle < 5.53) { phaseName = 'Waxing Crescent'; emoji = '🌒'; }
-  else if (dayInCycle < 9.22) { phaseName = 'First Quarter'; emoji = '🌓'; }
-  else if (dayInCycle < 12.91) { phaseName = 'Waxing Gibbous'; emoji = '🌔'; }
-  else if (dayInCycle < 16.61) { phaseName = 'Full Moon'; emoji = '🌕'; }
-  else if (dayInCycle < 20.30) { phaseName = 'Waning Gibbous'; emoji = '🌖'; }
-  else if (dayInCycle < 23.99) { phaseName = 'Last Quarter'; emoji = '🌗'; }
-  else if (dayInCycle < 27.68) { phaseName = 'Waning Crescent'; emoji = '🌘'; }
-  else { phaseName = 'New Moon'; emoji = '🌑'; }
+  // All 8 phases with their ranges
+  const phases = [
+    { name: 'New Moon', emoji: '🌑', start: 0, end: 1.85 },
+    { name: 'Waxing Crescent', emoji: '🌒', start: 1.85, end: 5.53 },
+    { name: 'First Quarter', emoji: '🌓', start: 5.53, end: 9.22 },
+    { name: 'Waxing Gibbous', emoji: '🌔', start: 9.22, end: 12.91 },
+    { name: 'Full Moon', emoji: '🌕', start: 12.91, end: 16.61 },
+    { name: 'Waning Gibbous', emoji: '🌖', start: 16.61, end: 20.30 },
+    { name: 'Last Quarter', emoji: '🌗', start: 20.30, end: 23.99 },
+    { name: 'Waning Crescent', emoji: '🌘', start: 23.99, end: 29.53 },
+  ];
+
+  let currentPhaseIndex = 0;
+  for (let i = 0; i < phases.length; i++) {
+    if (dayInCycle >= phases[i].start && dayInCycle < phases[i].end) {
+      currentPhaseIndex = i;
+      break;
+    }
+  }
+
+  const currentPhase = phases[currentPhaseIndex];
+  const nextPhaseIndex = (currentPhaseIndex + 1) % 8;
+  const daysUntilNext = phases[currentPhaseIndex].end - dayInCycle;
 
   return {
-    phase: phaseName,
-    emoji: emoji,
+    phase: currentPhase.name,
+    emoji: currentPhase.emoji,
     day_in_cycle: Math.round(dayInCycle * 10) / 10,
-    illumination: Math.round(Math.abs(Math.cos(dayInCycle / 29.53 * 2 * Math.PI)) * 100)
+    illumination: Math.round(Math.abs(Math.cos(dayInCycle / 29.53 * 2 * Math.PI)) * 100),
+    current_index: currentPhaseIndex,
+    all_phases: phases.map(p => ({ name: p.name, emoji: p.emoji })),
+    next_phase: phases[nextPhaseIndex].name,
+    days_until_next: Math.round(daysUntilNext * 10) / 10
+  };
+}
+
+function getYearProgress(now) {
+  const year = now.getFullYear();
+  const startOfYear = new Date(year, 0, 1);
+  const endOfYear = new Date(year + 1, 0, 1);
+
+  const dayOfYear = Math.floor((now - startOfYear) / (1000 * 60 * 60 * 24)) + 1;
+  const totalDays = Math.floor((endOfYear - startOfYear) / (1000 * 60 * 60 * 24));
+  const daysLeft = totalDays - dayOfYear;
+
+  // Week number (ISO)
+  const tempDate = new Date(now.getTime());
+  tempDate.setHours(0, 0, 0, 0);
+  tempDate.setDate(tempDate.getDate() + 3 - (tempDate.getDay() + 6) % 7);
+  const week1 = new Date(tempDate.getFullYear(), 0, 4);
+  const weekNumber = 1 + Math.round(((tempDate - week1) / 86400000 - 3 + (week1.getDay() + 6) % 7) / 7);
+
+  return {
+    year: year,
+    day_of_year: dayOfYear,
+    total_days: totalDays,
+    days_left: daysLeft,
+    week_number: weekNumber,
+    percent_complete: Math.round((dayOfYear / totalDays) * 100)
+  };
+}
+
+function getTimeTransitions(hour, minute) {
+  // Define periods: dawn(5-7), morning(7-12), afternoon(12-17), evening(17-20), night(20-5)
+  const transitions = [
+    { name: 'Dawn', start: 5, end: 7 },
+    { name: 'Morning', start: 7, end: 12 },
+    { name: 'Afternoon', start: 12, end: 17 },
+    { name: 'Evening', start: 17, end: 20 },
+    { name: 'Night', start: 20, end: 29 }, // 29 = 5am next day
+  ];
+
+  const currentTime = hour + minute / 60;
+  const adjustedTime = hour < 5 ? hour + 24 : hour; // Handle after midnight
+
+  let currentPeriod = null;
+  let timeInPeriod = 0;
+  let timeUntilNext = 0;
+  let nextPeriod = null;
+
+  for (let i = 0; i < transitions.length; i++) {
+    const t = transitions[i];
+    const start = t.start;
+    const end = t.end > 24 ? t.end : t.end;
+
+    if (adjustedTime >= start && adjustedTime < end) {
+      currentPeriod = t.name;
+      timeInPeriod = adjustedTime - start;
+      timeUntilNext = end - adjustedTime;
+      nextPeriod = transitions[(i + 1) % transitions.length].name;
+      break;
+    }
+  }
+
+  // Convert to hours and minutes
+  const hoursIn = Math.floor(timeInPeriod);
+  const minsIn = Math.round((timeInPeriod - hoursIn) * 60);
+  const hoursUntil = Math.floor(timeUntilNext);
+  const minsUntil = Math.round((timeUntilNext - hoursUntil) * 60);
+
+  return {
+    current: currentPeriod || 'Night',
+    time_in_period: `${hoursIn}h ${minsIn}m`,
+    time_until_next: `${hoursUntil}h ${minsUntil}m`,
+    next_period: nextPeriod || 'Dawn',
+    periods: [
+      { name: 'Dawn', hours: '5-7 AM', active: currentPeriod === 'Dawn' },
+      { name: 'Morning', hours: '7 AM-12 PM', active: currentPeriod === 'Morning' },
+      { name: 'Afternoon', hours: '12-5 PM', active: currentPeriod === 'Afternoon' },
+      { name: 'Evening', hours: '5-8 PM', active: currentPeriod === 'Evening' },
+      { name: 'Night', hours: '8 PM-5 AM', active: currentPeriod === 'Night' },
+    ]
   };
 }
 
@@ -314,6 +410,32 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {},
+    },
+  },
+  {
+    name: 'get_holidays',
+    description: 'Get Malaysian public holidays for the current year. Returns upcoming holidays.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        upcoming_only: {
+          type: 'boolean',
+          description: 'If true, only return holidays that haven\'t passed yet. Defaults to true.',
+        },
+      },
+    },
+  },
+  {
+    name: 'get_news',
+    description: 'Get top news headlines from Malaysia.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        limit: {
+          type: 'number',
+          description: 'Number of headlines to return. Defaults to 5.',
+        },
+      },
     },
   },
 ];
@@ -644,17 +766,170 @@ async function handleWeddingCountdown(args, env) {
   return getWeddingCountdown(now);
 }
 
+// Malaysian Public Holidays 2026 (Federal + Sabah)
+const HOLIDAYS_2026 = [
+  { date: '2026-01-01', name: 'New Year\'s Day', type: 'federal' },
+  { date: '2026-01-29', name: 'Thaipusam', type: 'federal' },
+  { date: '2026-02-17', name: 'Chinese New Year', type: 'federal' },
+  { date: '2026-02-18', name: 'Chinese New Year (Day 2)', type: 'federal' },
+  { date: '2026-03-10', name: 'Nuzul Al-Quran', type: 'federal' },
+  { date: '2026-03-20', name: 'Hari Raya Aidilfitri', type: 'federal' },
+  { date: '2026-03-21', name: 'Hari Raya Aidilfitri (Day 2)', type: 'federal' },
+  { date: '2026-03-30', name: 'TYT Sabah Birthday', type: 'sabah' },
+  { date: '2026-04-03', name: 'Good Friday', type: 'sabah' },
+  { date: '2026-04-19', name: 'WEDDING DAY', type: 'personal', special: true },
+  { date: '2026-05-01', name: 'Labour Day', type: 'federal' },
+  { date: '2026-05-12', name: 'Wesak Day', type: 'federal' },
+  { date: '2026-05-27', name: 'Hari Raya Haji', type: 'federal' },
+  { date: '2026-05-30', name: 'Harvest Festival', type: 'sabah' },
+  { date: '2026-05-31', name: 'Harvest Festival (Day 2)', type: 'sabah' },
+  { date: '2026-06-01', name: 'Yang di-Pertuan Agong\'s Birthday', type: 'federal' },
+  { date: '2026-06-17', name: 'Awal Muharram', type: 'federal' },
+  { date: '2026-08-26', name: 'Maulidur Rasul', type: 'federal' },
+  { date: '2026-08-31', name: 'Merdeka Day', type: 'federal' },
+  { date: '2026-09-16', name: 'Malaysia Day', type: 'federal' },
+  { date: '2026-10-18', name: 'Deepavali', type: 'federal' },
+  { date: '2026-12-25', name: 'Christmas Day', type: 'federal' },
+];
+
+async function handleGetHolidays(args, env) {
+  const now = new Date();
+  const year = now.getFullYear();
+  const upcomingOnly = args?.upcoming_only !== false; // default true
+
+  // Use hard-coded 2026 holidays (most reliable for Malaysia)
+  let holidays = HOLIDAYS_2026.map(h => ({ ...h }));
+
+  // Filter to upcoming if requested
+  if (upcomingOnly) {
+    const todayStr = now.toISOString().split('T')[0];
+    holidays = holidays.filter(h => h.date >= todayStr);
+  }
+
+  // Sort by date
+  holidays.sort((a, b) => a.date.localeCompare(b.date));
+
+  // Find next holiday
+  const todayStr = now.toISOString().split('T')[0];
+  const nextHoliday = holidays.find(h => h.date >= todayStr);
+
+  let daysUntilNext = null;
+  if (nextHoliday) {
+    const nextDate = new Date(nextHoliday.date + 'T00:00:00+08:00');
+    daysUntilNext = Math.ceil((nextDate.getTime() - now.getTime()) / (1000 * 60 * 60 * 24));
+  }
+
+  return {
+    year,
+    count: holidays.length,
+    next_holiday: nextHoliday ? {
+      ...nextHoliday,
+      days_until: daysUntilNext,
+      message: nextHoliday.special ? `${daysUntilNext} days until ${nextHoliday.name}!` :
+               daysUntilNext === 0 ? `Today is ${nextHoliday.name}!` :
+               daysUntilNext === 1 ? `Tomorrow: ${nextHoliday.name}` :
+               `${daysUntilNext} days until ${nextHoliday.name}`
+    } : null,
+    holidays: holidays.slice(0, 10) // Return up to 10 for brevity
+  };
+}
+
+async function fetchNewsFromRSS(url, cacheKey, sourceName, env) {
+  // Check cache first (30 minutes)
+  const cached = await env.SUNDIAL_KV.get(cacheKey, { type: 'json' });
+
+  if (cached && cached.fetched_at) {
+    const cacheAge = Date.now() - new Date(cached.fetched_at).getTime();
+    if (cacheAge < 30 * 60 * 1000) {
+      return { headlines: cached.headlines, cached: true };
+    }
+  }
+
+  try {
+    const response = await fetch(url, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; WorldBridge/1.0)' }
+    });
+
+    if (!response.ok) return { headlines: [], error: `Fetch failed: ${response.status}` };
+
+    const xml = await response.text();
+    const headlines = [];
+    const itemRegex = /<item>([\s\S]*?)<\/item>/g;
+    const titleRegex = /<title><!\[CDATA\[(.*?)\]\]><\/title>|<title>(.*?)<\/title>/;
+    const linkRegex = /<link>(.*?)<\/link>/;
+    const sourceRegex = /<source[^>]*>(.*?)<\/source>/;
+
+    let match;
+    while ((match = itemRegex.exec(xml)) !== null && headlines.length < 10) {
+      const item = match[1];
+      const titleMatch = item.match(titleRegex);
+      const linkMatch = item.match(linkRegex);
+      const sourceMatch = item.match(sourceRegex);
+
+      if (titleMatch) {
+        headlines.push({
+          title: (titleMatch[1] || titleMatch[2] || '').trim(),
+          link: linkMatch ? linkMatch[1] : null,
+          source: sourceMatch ? sourceMatch[1] : sourceName
+        });
+      }
+    }
+
+    if (headlines.length > 0) {
+      await env.SUNDIAL_KV.put(cacheKey, JSON.stringify({
+        headlines,
+        fetched_at: new Date().toISOString()
+      }));
+    }
+
+    return { headlines, cached: false };
+  } catch (e) {
+    return { headlines: [], error: e.message };
+  }
+}
+
+async function handleGetNews(args, env) {
+  const limit = args?.limit || 5;
+
+  // Fetch both Malaysia and World news in parallel
+  const [malaysia, world] = await Promise.all([
+    fetchNewsFromRSS(
+      'https://news.google.com/rss?hl=en-MY&gl=MY&ceid=MY:en',
+      'news_malaysia',
+      'Malaysia',
+      env
+    ),
+    fetchNewsFromRSS(
+      'https://news.google.com/rss/topics/CAAqJggKIiBDQkFTRWdvSUwyMHZNRGx1YlY4U0FtVnVHZ0pWVXlnQVAB?hl=en&gl=US&ceid=US:en',
+      'news_world',
+      'World',
+      env
+    )
+  ]);
+
+  return {
+    malaysia: malaysia.headlines.slice(0, limit),
+    world: world.headlines.slice(0, limit),
+    cached: malaysia.cached && world.cached
+  };
+}
+
 async function handleWorldState(args, env) {
   const now = new Date();
   const timeData = getTimeInZone(DEFAULT_TIMEZONE);
 
-  // Get hour for calculations
+  // Get hour and minute for calculations
   const hourFormatter = new Intl.DateTimeFormat('en-US', {
     timeZone: DEFAULT_TIMEZONE,
     hour: 'numeric',
     hour12: false,
   });
+  const minuteFormatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: DEFAULT_TIMEZONE,
+    minute: 'numeric',
+  });
   const hour = parseInt(hourFormatter.format(now));
+  const minute = parseInt(minuteFormatter.format(now));
 
   // Fetch weather and air quality in parallel
   const [weather, airQuality] = await Promise.all([
@@ -667,8 +942,18 @@ async function handleWorldState(args, env) {
   const moon = getMoonPhase(now);
   const isWeekend = now.getDay() === 0 || now.getDay() === 6;
 
+  // Year progress and time transitions
+  const yearProgress = getYearProgress(now);
+  const timeTransitions = getTimeTransitions(hour, minute);
+
   // Wedding countdown
   const wedding = getWeddingCountdown(now);
+
+  // Get holidays (just next one for world state)
+  const holidays = await handleGetHolidays({ upcoming_only: true }, env);
+
+  // Get news headlines (both Malaysia and World)
+  const news = await handleGetNews({ limit: 3 }, env);
 
   // Combine weather overlay with time colors
   let finalOverlay = 'clear';
@@ -709,13 +994,28 @@ async function handleWorldState(args, env) {
 
     wedding: wedding,
 
+    holidays: {
+      next: holidays.next_holiday,
+      upcoming: holidays.holidays?.slice(0, 5) || []
+    },
+
+    year: yearProgress,
+
+    transitions: timeTransitions,
+
+    news: {
+      malaysia: news.malaysia || [],
+      world: news.world || []
+    },
+
     // I FEEL summary for Jace
     i_feel: {
       temperature: weather.error ? 'unknown' : `${weather.temperature.current}°C, ${weather.temperature.color.description}`,
       air: airQuality.error ? 'unknown' : airQuality.aqi.description,
       sky: `${adjustedColors.description}`,
       moon: `${moon.emoji} ${moon.phase}`,
-      wedding: wedding.message
+      wedding: wedding.message,
+      holiday: holidays.next_holiday?.message || null
     }
   };
 }
@@ -735,6 +1035,8 @@ async function executeTool(name, args, env) {
     case 'get_sky': return handleGetSky(args, env);
     case 'wedding_countdown': return handleWeddingCountdown(args, env);
     case 'world_state': return handleWorldState(args, env);
+    case 'get_holidays': return handleGetHolidays(args, env);
+    case 'get_news': return handleGetNews(args, env);
     default: return { error: `Unknown tool: ${name}` };
   }
 }
@@ -876,6 +1178,36 @@ export default {
     if (url.pathname === '/weather' && request.method === 'GET') {
       try {
         const result = await handleGetWeather({}, env);
+        return new Response(JSON.stringify(result, null, 2), {
+          headers: { 'Content-Type': 'application/json', ...corsHeaders },
+        });
+      } catch (e) {
+        return new Response(JSON.stringify({ error: e.message }), {
+          status: 500,
+          headers: { 'Content-Type': 'application/json', ...corsHeaders },
+        });
+      }
+    }
+
+    // Holidays REST endpoint
+    if (url.pathname === '/holidays' && request.method === 'GET') {
+      try {
+        const result = await handleGetHolidays({}, env);
+        return new Response(JSON.stringify(result, null, 2), {
+          headers: { 'Content-Type': 'application/json', ...corsHeaders },
+        });
+      } catch (e) {
+        return new Response(JSON.stringify({ error: e.message }), {
+          status: 500,
+          headers: { 'Content-Type': 'application/json', ...corsHeaders },
+        });
+      }
+    }
+
+    // News REST endpoint
+    if (url.pathname === '/news' && request.method === 'GET') {
+      try {
+        const result = await handleGetNews({}, env);
         return new Response(JSON.stringify(result, null, 2), {
           headers: { 'Content-Type': 'application/json', ...corsHeaders },
         });
