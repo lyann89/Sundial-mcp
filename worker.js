@@ -1473,6 +1473,36 @@ export default {
       }
     }
 
+    // Visual dashboard: /sense.svg - returns SVG image
+    if (url.pathname === '/sense.svg' && request.method === 'GET') {
+      try {
+        const worldData = await handleWorldState({}, env);
+        const svg = generateWorldSenseSVG(worldData);
+        return new Response(svg, {
+          headers: { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'no-cache', ...corsHeaders },
+        });
+      } catch (e) {
+        return new Response(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 100"><text x="20" y="50" fill="red">Error: ${e.message}</text></svg>`, {
+          headers: { 'Content-Type': 'image/svg+xml', ...corsHeaders },
+        });
+      }
+    }
+
+    // Visual dashboard: /calendar.svg - returns SVG image
+    if (url.pathname === '/calendar.svg' && request.method === 'GET') {
+      try {
+        const worldData = await handleWorldState({}, env);
+        const svg = generateWorldCalendarSVG(worldData);
+        return new Response(svg, {
+          headers: { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'no-cache', ...corsHeaders },
+        });
+      } catch (e) {
+        return new Response(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 100"><text x="20" y="50" fill="red">Error: ${e.message}</text></svg>`, {
+          headers: { 'Content-Type': 'image/svg+xml', ...corsHeaders },
+        });
+      }
+    }
+
     return new Response('Not found', { status: 404, headers: corsHeaders });
   },
 };
