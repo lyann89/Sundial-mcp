@@ -869,7 +869,7 @@ async function handleGetHolidays(args, env) {
   };
 }
 
-async function fetchNewsFromRSS(url, cacheKey, sourceName, env) {
+async function fetchNewsFromRSS(url, cacheKey, sourceName, env, timeoutMs = 2500) {
   // Check cache first (30 minutes)
   const cached = await env.SUNDIAL_KV.get(cacheKey, { type: 'json' });
 
@@ -927,7 +927,7 @@ async function handleGetNews(args, env) {
   const limit = args?.limit || 5;
 
   // Fetch both Malaysia and World news in parallel
-  const [malaysia, world] = await Promise.all([
+  const [malaysiaR, worldR] = await Promise.allSettled([
     fetchNewsFromRSS(
       'https://news.google.com/rss?hl=en-MY&gl=MY&ceid=MY:en',
       'news_malaysia',
@@ -941,6 +941,8 @@ async function handleGetNews(args, env) {
       env
     )
   ]);
+  const malaysia = malaysiaR.status === 'fulfilled' ? malaysiaR.value : [];
+  const world = worldR.status === 'fulfilled' ? worldR.value : [];
 
   return {
     malaysia: malaysia.headlines.slice(0, limit),
@@ -976,12 +978,16 @@ async function handleWorldState(args, env) {
   // Fetch weather and air quality in parallel
   // allSettled (Jul 4 2026): one dead upstream must degrade the field,
   // not hang or fail the whole world state.
-  const [weatherR, airQualityR] = await Promise.allSettled([
+  const [weatherR, airQualityR, holidaysR, newsR] = await Promise.allSettled([
     handleGetWeather(args, env),
-    handleGetAirQuality(args, env)
+    handleGetAirQuality(args, env),
+    handleGetHolidays({ upcoming_only: true }, env),
+    handleGetNews({ limit: 3 }, env)
   ]);
   const weather = weatherR.status === 'fulfilled' ? weatherR.value : { error: 'weather unavailable' };
   const airQuality = airQualityR.status === 'fulfilled' ? airQualityR.value : { error: 'air quality unavailable' };
+  const holidaysPre = holidaysR.status === 'fulfilled' ? holidaysR.value : { error: 'holidays unavailable' };
+  const newsPre = newsR.status === 'fulfilled' ? newsR.value : { error: 'news unavailable' };
 
   // Calculate sky state
   const colors = getTimeOfDayColors(hour);
@@ -996,10 +1002,10 @@ async function handleWorldState(args, env) {
   const wedding = getWeddingCountdown(now);
 
   // Get holidays (just next one for world state)
-  const holidays = await handleGetHolidays({ upcoming_only: true }, env);
+  const holidays = holidaysPre;
 
   // Get news headlines (both Malaysia and World)
-  const news = await handleGetNews({ limit: 3 }, env);
+  const news = newsPre;
 
   // Combine weather overlay with time colors
   let finalOverlay = 'clear';
