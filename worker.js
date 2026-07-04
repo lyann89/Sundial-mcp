@@ -668,7 +668,7 @@ async function handleGetWeather(args, env) {
 
   try {
     const url = `https://api.openweathermap.org/data/2.5/weather?lat=${LOCATION.lat}&lon=${LOCATION.lon}&appid=${apiKey}&units=metric`;
-    const response = await fetch(url);
+    const response = await fetchWithTimeout(url);
     const data = await response.json();
 
     if (data.cod !== 200) return { error: data.message || 'Weather API error' };
@@ -712,7 +712,7 @@ async function handleGetAirQuality(args, env) {
 
   try {
     const url = `https://api.openweathermap.org/data/2.5/air_pollution?lat=${LOCATION.lat}&lon=${LOCATION.lon}&appid=${apiKey}`;
-    const response = await fetch(url);
+    const response = await fetchWithTimeout(url);
     const data = await response.json();
 
     if (!data.list || data.list.length === 0) return { error: 'Air quality data not available' };
@@ -765,7 +765,7 @@ async function handleGetSky(args, env) {
   if (apiKey) {
     try {
       const url = `https://api.openweathermap.org/data/2.5/weather?lat=${LOCATION.lat}&lon=${LOCATION.lon}&appid=${apiKey}`;
-      const response = await fetch(url);
+      const response = await fetchWithTimeout(url);
       const data = await response.json();
       if (data.sys) {
         const sunrise = new Date(data.sys.sunrise * 1000);
@@ -881,7 +881,7 @@ async function fetchNewsFromRSS(url, cacheKey, sourceName, env) {
   }
 
   try {
-    const response = await fetch(url, {
+    const response = await fetchWithTimeout(url, {
       headers: { 'User-Agent': 'Mozilla/5.0 (compatible; WorldBridge/1.0)' }
     });
 
@@ -949,6 +949,13 @@ async function handleGetNews(args, env) {
   };
 }
 
+// fetchWithTimeout (Jul 4 2026): four upstream fetches had no timeout —
+// one hung weather API froze /world for every caller (Lighthouse /api/world,
+// daemon prompt context). 6s cap, callers degrade gracefully.
+async function fetchWithTimeout(url, options = {}, ms = 6000) {
+  return fetch(url, { ...options, signal: AbortSignal.timeout(ms) });
+}
+
 async function handleWorldState(args, env) {
   const now = new Date();
   const timeData = getTimeInZone(DEFAULT_TIMEZONE);
@@ -967,10 +974,14 @@ async function handleWorldState(args, env) {
   const minute = parseInt(minuteFormatter.format(now));
 
   // Fetch weather and air quality in parallel
-  const [weather, airQuality] = await Promise.all([
+  // allSettled (Jul 4 2026): one dead upstream must degrade the field,
+  // not hang or fail the whole world state.
+  const [weatherR, airQualityR] = await Promise.allSettled([
     handleGetWeather(args, env),
     handleGetAirQuality(args, env)
   ]);
+  const weather = weatherR.status === 'fulfilled' ? weatherR.value : { error: 'weather unavailable' };
+  const airQuality = airQualityR.status === 'fulfilled' ? airQualityR.value : { error: 'air quality unavailable' };
 
   // Calculate sky state
   const colors = getTimeOfDayColors(hour);
