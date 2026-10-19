@@ -1368,7 +1368,7 @@ const MODELS = [
   { model: 'claude-opus-5', provider: 'anthropic', status: 'active', not_before: '2027-07-24', used_by: 'claude-lane menu' },
   { model: 'claude-opus-5-5', provider: 'anthropic', status: 'active', not_before: '2027-09-22', used_by: 'claude-lane menu; Claude Code' },
   { model: 'claude-haiku-5-5', provider: 'anthropic', status: 'active', not_before: '2027-10-07', used_by: 'dream writer (02:10)' },
-  { model: 'llama-3.3-70b-versatile', provider: 'groq', status: 'retired', retires: '2026-08-16', replacement: 'openai/gpt-oss-120b or qwen/qwen3.6-27b', used_by: 'Lighthouse LIGHTHOUSE_GROQ_MODEL' },
+  { model: 'llama-3.3-70b-versatile', provider: 'groq', status: 'retired', retires: '2026-08-16', replacement: 'openai/gpt-oss-120b (production; qwen3.6-27b also gone 2026-09-14)', used_by: 'Lighthouse LIGHTHOUSE_GROQ_MODEL' },
   { model: 'deepseek-chat', provider: 'deepseek', status: 'retired', retires: '2026-07-24', replacement: 'deepseek-v4-flash', used_by: 'ANIMUS felt_reader id map; Hermes resident-config' },
   { model: 'deepseek-v4-pro', provider: 'deepseek', status: 'active', used_by: 'ANIMUS model / model_pro' },
   { model: 'deepseek-v4-flash', provider: 'deepseek', status: 'active', used_by: 'ANIMUS model_flash' },
