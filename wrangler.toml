@@ -8,3 +8,7 @@ compatibility_date = "2024-09-23"
 [[kv_namespaces]]
 binding = "SUNDIAL_KV"
 id = "2f6ef4e8875c4f1f950558bfbc7dec43"
+
+# Sundial 2.2 (Oct 19 2026): status every 30 min; daily note 06:00 MYT (22:00 UTC)
+[triggers]
+crons = ["*/30 * * * *", "0 22 * * *"]

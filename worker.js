@@ -473,6 +473,27 @@ const TOOLS = [
       },
     },
   },
+  {
+    name: 'service_status',
+    description: 'Live status of the services the House runs on: Anthropic, Cloudflare, GitHub, Discord, DigitalOcean (the droplet). States: operational, degraded, outage, unknown. Also lists recent changes.',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+    },
+  },
+  {
+    name: 'what_changed',
+    description: 'What the world did over the last few days, from Sundial\'s daily notes (taken 06:00 MYT): rain/grey tallies, temperature swings, service outages. Say one line of it, not all.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        days: {
+          type: 'number',
+          description: 'How many past days, 1 to 14. Defaults to 3.',
+        },
+      },
+    },
+  },
 ];
 
 // ─── Tool Handlers ──────────────────────────────────────────
@@ -523,6 +544,17 @@ async function handleSessionStart(args, env) {
       context: gapContext(gapMs),
       last_note: lastEnd.note || null,
     };
+  }
+
+  // Long gap (12h+): what the world did while we were apart, from daily notes
+  if (gap && gap.milliseconds >= 12 * 3600000) {
+    try {
+      const days = Math.min(14, Math.ceil(gap.milliseconds / 86400000));
+      const changed = await buildWhatChanged(days, env);
+      if (changed.lines.length) gap.since_last_time = changed.lines;
+    } catch (e) {
+      console.warn('[session_start] since_last_time failed:', e.message);
+    }
   }
 
   // Store session start
@@ -958,6 +990,170 @@ async function fetchWithTimeout(url, options = {}, ms = 6000) {
   return fetch(url, { ...options, signal: AbortSignal.timeout(ms) });
 }
 
+// ─── Service Status + Daily Notes (Sundial 2.2, Oct 19 2026) ─
+// Ideas from nekyialabs/aware-skill; our own code. Plan:
+// docs/plans/2026-10-19-sundial-watches-models-status-notes.md
+// KV writes only on a state change (status) or once a day (note), so a
+// quiet day costs ~1 write.
+
+// Statuspage v2 bases. Not summary.json: Cloudflare's is 235 KB / 5s and timed
+// out; status.json + incidents/unresolved.json are a few KB.
+const STATUS_PAGES = {
+  anthropic: 'https://status.claude.com',
+  cloudflare: 'https://www.cloudflarestatus.com',
+  github: 'https://www.githubstatus.com',
+  discord: 'https://discordstatus.com',
+  digitalocean: 'https://status.digitalocean.com', // the droplet's host
+};
+
+const STATUS_LOG_MAX = 20;
+const NOTE_TTL_SECONDS = 35 * 86400;
+
+async function fetchServiceStatus() {
+  const names = Object.keys(STATUS_PAGES);
+  const results = await Promise.allSettled(names.map(async (name) => {
+    const base = STATUS_PAGES[name];
+    const [st, inc] = await Promise.all([
+      fetchWithTimeout(`${base}/api/v2/status.json`, {}, 4000).then(r => r.json()),
+      fetchWithTimeout(`${base}/api/v2/incidents/unresolved.json`, {}, 4000).then(r => r.json()),
+    ]);
+    const incidents = inc.incidents || [];
+    const serious = incidents.filter(i => ['major', 'critical'].includes(i.impact));
+    const state = serious.length ? 'outage'
+      : (st.status?.indicator === 'none' && !incidents.length) ? 'operational' : 'degraded';
+    return { state, incident: incidents[0]?.name || null };
+  }));
+  const services = {};
+  results.forEach((r, i) => {
+    services[names[i]] = r.status === 'fulfilled' ? r.value : { state: 'unknown', incident: null };
+  });
+  return services;
+}
+
+// Cron path. 'unknown' (a status page timing out) never counts as a change:
+// a flaky fetch must not log a phantom outage or cost a write.
+async function pollServiceStatus(env) {
+  const services = await fetchServiceStatus();
+  const prev = await env.SUNDIAL_KV.get('status:last', { type: 'json' });
+  const now = new Date().toISOString();
+  const events = [];
+  const merged = {};
+  for (const [name, cur] of Object.entries(services)) {
+    const before = prev?.services?.[name];
+    if (cur.state === 'unknown') { merged[name] = before || cur; continue; }
+    merged[name] = cur;
+    if (before && before.state !== 'unknown' && before.state !== cur.state) {
+      events.push({ at: now, service: name, from: before.state, to: cur.state, incident: cur.incident });
+    }
+  }
+  if (!prev || events.length) {
+    await env.SUNDIAL_KV.put('status:last', JSON.stringify({ changed_at: now, services: merged }));
+  }
+  if (events.length) {
+    const log = (await env.SUNDIAL_KV.get('status:log', { type: 'json' })) || [];
+    await env.SUNDIAL_KV.put('status:log', JSON.stringify([...log, ...events].slice(-STATUS_LOG_MAX)));
+  }
+  return { services: merged, events };
+}
+
+async function handleServiceStatus(args, env) {
+  const services = await fetchServiceStatus();
+  const log = (await env.SUNDIAL_KV.get('status:log', { type: 'json' })) || [];
+  const notOk = Object.entries(services).filter(([, s]) => s.state !== 'operational');
+  return {
+    checked_at: new Date().toISOString(),
+    summary: notOk.length
+      ? notOk.map(([n, s]) => `${n}: ${s.state}${s.incident ? ` (${s.incident})` : ''}`).join('; ')
+      : 'All services operational',
+    services,
+    recent_changes: log.slice(-5),
+  };
+}
+
+function mytDate(d) {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: DEFAULT_TIMEZONE }).format(d); // YYYY-MM-DD
+}
+
+function wmoSky(code) {
+  if (code >= 95) return 'storm';
+  if ((code >= 51 && code <= 67) || (code >= 80 && code <= 82)) return 'rain';
+  if (code === 45 || code === 48) return 'fog';
+  if (code === 3) return 'overcast';
+  if (code === 1 || code === 2) return 'partly cloudy';
+  if (code === 0) return 'clear';
+  return 'mixed';
+}
+
+// 06:00 MYT cron. Notes YESTERDAY as a whole day (Open-Meteo daily, no key):
+// a single morning reading can't say whether a day was grey.
+async function writeDailyNote(env) {
+  const url = `https://api.open-meteo.com/v1/forecast?latitude=${LOCATION.lat}&longitude=${LOCATION.lon}` +
+    `&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,cloud_cover_mean` +
+    `&past_days=1&forecast_days=1&timezone=${encodeURIComponent(DEFAULT_TIMEZONE)}`;
+  const r = await fetchWithTimeout(url, {}, 8000);
+  const d = (await r.json()).daily;
+  if (!d?.time?.length) throw new Error('open-meteo returned no daily data');
+  const date = d.time[0];
+
+  const [airR, newsR, logR] = await Promise.allSettled([
+    handleGetAirQuality({}, env),
+    handleGetNews({ limit: 1 }, env),
+    env.SUNDIAL_KV.get('status:log', { type: 'json' }),
+  ]);
+  const air = airR.status === 'fulfilled' && !airR.value.error ? airR.value : null;
+  const log = (logR.status === 'fulfilled' && logR.value) || [];
+
+  const note = {
+    date,
+    sky: wmoSky(d.weather_code[0]),
+    weather_code: d.weather_code[0],
+    temp_min: d.temperature_2m_min[0],
+    temp_max: d.temperature_2m_max[0],
+    rain_mm: d.precipitation_sum[0],
+    cloud_pct: d.cloud_cover_mean[0],
+    aqi_6am: air?.aqi?.value ?? null,
+    service_events: log.filter(e => mytDate(new Date(e.at)) === date),
+    morning_headline: newsR.status === 'fulfilled' ? (newsR.value.malaysia?.[0]?.title || null) : null,
+    written_at: new Date().toISOString(),
+  };
+  await env.SUNDIAL_KV.put(`note:${date}`, JSON.stringify(note), { expirationTtl: NOTE_TTL_SECONDS });
+  return note;
+}
+
+async function buildWhatChanged(days, env) {
+  const dates = [];
+  for (let i = 1; i <= days; i++) dates.push(mytDate(new Date(Date.now() - i * 86400000)));
+  const notes = await Promise.all(dates.map(dt => env.SUNDIAL_KV.get(`note:${dt}`, { type: 'json' })));
+  const have = notes.filter(Boolean);
+  const lines = [];
+
+  if (have.length >= 2) {
+    const wet = have.filter(n => n.sky === 'rain' || n.sky === 'storm').length;
+    const grey = have.filter(n => n.cloud_pct >= 80).length;
+    if (wet) lines.push(`Rain on ${wet} of the last ${have.length} days.`);
+    if (grey >= Math.ceil(have.length * 0.7)) lines.push(`Grey: ${grey} of ${have.length} days were mostly overcast.`);
+    const maxes = have.map(n => n.temp_max);
+    if (Math.max(...maxes) - Math.min(...maxes) >= 4) lines.push(`Highs swung between ${Math.min(...maxes)}°C and ${Math.max(...maxes)}°C.`);
+  }
+  for (const n of have) {
+    for (const e of n.service_events || []) {
+      lines.push(`${n.date}: ${e.service} went ${e.from} → ${e.to}${e.incident ? ` (${e.incident})` : ''}.`);
+    }
+  }
+  const missing = dates.filter((dt, i) => !notes[i]);
+  return {
+    days,
+    lines,
+    notes: have.map(n => ({ date: n.date, sky: n.sky, temp: `${n.temp_min}–${n.temp_max}°C`, rain_mm: n.rain_mm })),
+    missing_notes: missing,
+  };
+}
+
+async function handleWhatChanged(args, env) {
+  const days = Math.min(14, Math.max(1, parseInt(args?.days) || 3));
+  return buildWhatChanged(days, env);
+}
+
 async function handleWorldState(args, env) {
   const now = new Date();
   const timeData = getTimeInZone(DEFAULT_TIMEZONE);
@@ -988,6 +1184,16 @@ async function handleWorldState(args, env) {
   const airQuality = airQualityR.status === 'fulfilled' ? airQualityR.value : { error: 'air quality unavailable' };
   const holidaysPre = holidaysR.status === 'fulfilled' ? holidaysR.value : { error: 'holidays unavailable' };
   const newsPre = newsR.status === 'fulfilled' ? newsR.value : { error: 'news unavailable' };
+  // Last cron-observed service state (no live fetch: world_state stays fast)
+  let servicesDown = [];
+  try {
+    const st = await env.SUNDIAL_KV.get('status:last', { type: 'json' });
+    servicesDown = Object.entries(st?.services || {})
+      .filter(([, s]) => s.state !== 'operational' && s.state !== 'unknown')
+      .map(([n, s]) => `${n}: ${s.state}${s.incident ? ` (${s.incident})` : ''}`);
+  } catch (e) {
+    console.warn('[world_state] status read failed:', e.message);
+  }
 
   // Calculate sky state
   const colors = getTimeOfDayColors(hour);
@@ -1059,6 +1265,9 @@ async function handleWorldState(args, env) {
       malaysia: news.malaysia || [],
       world: news.world || []
     },
+
+    // Only what's not fine; empty on a quiet day
+    services: servicesDown,
 
     // I FEEL summary for Jace
     i_feel: {
@@ -1301,6 +1510,8 @@ async function executeTool(name, args, env) {
     case 'world_sense': return handleWorldSense(args, env);
     case 'world_calendar': return handleWorldCalendar(args, env);
     case 'world_headline': return handleWorldHeadline(args, env);
+    case 'service_status': return handleServiceStatus(args, env);
+    case 'what_changed': return handleWhatChanged(args, env);
     default: return { error: `Unknown tool: ${name}` };
   }
 }
@@ -1334,7 +1545,7 @@ async function handleMCP(request, env) {
         capabilities: { tools: {} },
         serverInfo: {
           name: 'sundial-mcp',
-          version: '2.0.0',
+          version: '2.2.0',
         },
       });
 
@@ -1425,7 +1636,7 @@ export default {
 
     // Health check
     if (url.pathname === '/health') {
-      return new Response(JSON.stringify({ status: 'ok', service: 'sundial-mcp', version: '2.0.0' }), {
+      return new Response(JSON.stringify({ status: 'ok', service: 'sundial-mcp', version: '2.2.0' }), {
         headers: { 'Content-Type': 'application/json', ...corsHeaders },
       });
     }
@@ -1521,5 +1732,12 @@ export default {
     }
 
     return new Response('Not found', { status: 404, headers: corsHeaders });
+  },
+
+  // Crons (wrangler.toml): status every 30 min, daily note 22:00 UTC = 06:00 MYT.
+  // Failures log at error: a silent dead cron is how organs die here.
+  async scheduled(event, env, ctx) {
+    const job = event.cron === '0 22 * * *' ? writeDailyNote(env) : pollServiceStatus(env);
+    ctx.waitUntil(job.catch(e => console.error(`[cron ${event.cron}] failed:`, e.message)));
   },
 };
