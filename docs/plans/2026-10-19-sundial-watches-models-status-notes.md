@@ -1,6 +1,7 @@
 # Sundial 2.2: Watches, Model Lifecycle, Service Status, Daily Notes
 
-Status: DRAFT, waiting on Belle's approval. Nothing is built.
+Status (Oct 19 2026): A+B LIVE (91c1a4e). C LIVE with write token (48c9d4f). D LIVE + E written (see git log).
+Token timing: Belle chose "together with watch_add" (shipped in C).
 Inspired by: github.com/nekyialabs/aware-skill (skill docs only, no code; ideas taken, connector not adopted).
 
 ## Goal

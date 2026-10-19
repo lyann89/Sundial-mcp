@@ -508,6 +508,14 @@ const TOOLS = [
     },
   },
   {
+    name: 'model_lifecycle',
+    description: 'Retirement dates for the AI models the House actually runs (claude-lane, Lighthouse, ANIMUS, dream writer, Hermes), each with its source link and the date it was verified, plus alarms when a provider\'s deprecation page changes. Always give the source and say to check it before depending on a date.',
+    inputSchema: {
+      type: 'object',
+      properties: { model: { type: 'string', description: 'Optional filter, e.g. "sonnet" or "haiku-4-5".' } },
+    },
+  },
+  {
     name: 'watch_list',
     description: 'List active watches and ones that fired in the last 24h.',
     inputSchema: { type: 'object', properties: {} },
@@ -1332,6 +1340,120 @@ async function getFiredWatches(env) {
     .map(w => `${w.label}: ${w.fired_detail}`);
 }
 
+// ─── Model Lifecycle (Sundial 2.2 phase D) ──────────────────
+// A human-verified list, not scraped dates: a scraper that breaks returns
+// wrong dates silently. Each entry carries its source and the day it was
+// checked. Daily, each provider's deprecation page is reduced to the SET of
+// model ids it mentions; when that set changes, an alarm says "re-check".
+// (A raw page hash would alarm every day: these pages rebuild constantly.)
+// used_by = where the House actually runs it, read from live configs Oct 19.
+
+const MODEL_PAGES = {
+  anthropic: 'https://platform.claude.com/docs/en/about-claude/model-deprecations.md',
+  openai: 'https://platform.openai.com/docs/deprecations',
+  groq: 'https://console.groq.com/docs/deprecations',
+  deepseek: 'https://api-docs.deepseek.com/updates',
+};
+const MODELS_VERIFIED = '2026-10-19';
+
+const MODELS = [
+  { model: 'claude-sonnet-4-5', provider: 'anthropic', status: 'deprecated', retires: '2026-11-30', replacement: 'claude-sonnet-5-5', used_by: 'claude-lane menu (sonnet-4-5)' },
+  { model: 'claude-opus-4-5', provider: 'anthropic', status: 'active', not_before: '2026-11-24', used_by: 'claude-lane menu (opus-4-5)' },
+  { model: 'claude-haiku-4-5', provider: 'anthropic', status: 'active', not_before: '2026-10-15', used_by: 'Lighthouse LIGHTHOUSE_MODEL; claude-lane menu' },
+  { model: 'claude-opus-4-6', provider: 'anthropic', status: 'active', not_before: '2027-02-05', used_by: 'claude-lane menu' },
+  { model: 'claude-sonnet-4-6', provider: 'anthropic', status: 'active', not_before: '2027-02-17', used_by: 'claude-lane DEFAULT' },
+  { model: 'claude-opus-4-8', provider: 'anthropic', status: 'active', not_before: '2027-05-28', used_by: 'claude-lane menu' },
+  { model: 'claude-fable-5', provider: 'anthropic', status: 'active', not_before: '2027-06-09', used_by: 'claude-lane menu' },
+  { model: 'claude-sonnet-5', provider: 'anthropic', status: 'active', not_before: '2027-06-30', used_by: 'claude-lane menu' },
+  { model: 'claude-opus-5', provider: 'anthropic', status: 'active', not_before: '2027-07-24', used_by: 'claude-lane menu' },
+  { model: 'claude-opus-5-5', provider: 'anthropic', status: 'active', not_before: '2027-09-22', used_by: 'claude-lane menu; Claude Code' },
+  { model: 'claude-haiku-5-5', provider: 'anthropic', status: 'active', not_before: '2027-10-07', used_by: 'dream writer (02:10)' },
+  { model: 'llama-3.3-70b-versatile', provider: 'groq', status: 'retired', retires: '2026-08-16', replacement: 'openai/gpt-oss-120b or qwen/qwen3.6-27b', used_by: 'Lighthouse LIGHTHOUSE_GROQ_MODEL' },
+  { model: 'deepseek-chat', provider: 'deepseek', status: 'retired', retires: '2026-07-24', replacement: 'deepseek-v4-flash', used_by: 'ANIMUS felt_reader id map; Hermes resident-config' },
+  { model: 'deepseek-v4-pro', provider: 'deepseek', status: 'active', used_by: 'ANIMUS model / model_pro' },
+  { model: 'deepseek-v4-flash', provider: 'deepseek', status: 'active', used_by: 'ANIMUS model_flash' },
+  { model: 'gpt-5.6-sol', provider: 'openai', status: 'active', used_by: 'Jace + Nico Hermes residents' },
+];
+
+const MODEL_ID_RE = /\b(claude-[a-z0-9.-]+|gpt-[0-9][a-z0-9.-]*|o[0-9]-[a-z0-9-]+|llama-[a-z0-9.-]+|deepseek-[a-z0-9.-]+|qwen\/[a-z0-9.-]+|openai\/gpt-[a-z0-9.-]+)\b/gi;
+
+function daysUntil(dateStr) {
+  return Math.round((Date.parse(dateStr) - Date.parse(mytDate(new Date()))) / 86400000);
+}
+
+function modelLine(m) {
+  if (m.status === 'retired') {
+    return `${m.model} RETIRED ${m.retires} but the House still references it (${m.used_by}). Replacement: ${m.replacement}.`;
+  }
+  if (m.retires) {
+    const d = daysUntil(m.retires);
+    return `${m.model} ${m.status}, retires ${m.retires} (${d} days) - ${m.used_by}${m.replacement ? `. Replacement: ${m.replacement}` : ''}.`;
+  }
+  if (m.not_before && daysUntil(m.not_before) <= 0) {
+    return `${m.model}: "not sooner than ${m.not_before}" has passed; a retirement can be announced any time (${m.used_by}).`;
+  }
+  if (m.not_before && daysUntil(m.not_before) <= 60) {
+    return `${m.model}: guaranteed only until ${m.not_before} (${daysUntil(m.not_before)} days) - ${m.used_by}.`;
+  }
+  return null;
+}
+
+// Daily cron. Fails per provider, never all at once.
+async function checkModelPages(env) {
+  const changed = [];
+  await Promise.allSettled(Object.entries(MODEL_PAGES).map(async ([provider, url]) => {
+    try {
+      const text = await (await fetchWithTimeout(url, {}, 10000)).text();
+      const ids = [...new Set((text.match(MODEL_ID_RE) || []).map(s => s.toLowerCase()))].sort();
+      if (ids.length < 3) throw new Error(`only ${ids.length} model ids found; page shape changed?`);
+      const key = `models:page_ids:${provider}`;
+      const prev = await env.SUNDIAL_KV.get(key, { type: 'json' });
+      if (!prev) {
+        await env.SUNDIAL_KV.put(key, JSON.stringify({ ids, since: new Date().toISOString() }));
+        return;
+      }
+      const added = ids.filter(i => !prev.ids.includes(i));
+      const removed = prev.ids.filter(i => !ids.includes(i));
+      if (added.length || removed.length) {
+        changed.push({ provider, url, added, removed, at: new Date().toISOString() });
+        await env.SUNDIAL_KV.put(key, JSON.stringify({ ids, since: new Date().toISOString() }));
+      }
+    } catch (e) {
+      console.error(`[models] ${provider} page check failed:`, e.message);
+    }
+  }));
+  if (changed.length) {
+    const alarms = (await env.SUNDIAL_KV.get('models:alarms', { type: 'json' })) || [];
+    await env.SUNDIAL_KV.put('models:alarms', JSON.stringify([...alarms, ...changed].slice(-20)));
+  }
+  return changed;
+}
+
+async function getModelAlerts(env) {
+  const lines = MODELS.map(modelLine).filter(Boolean);
+  const alarms = (await env.SUNDIAL_KV.get('models:alarms', { type: 'json' })) || [];
+  const recent = alarms.filter(a => Date.now() - Date.parse(a.at) < 7 * 86400000);
+  for (const a of recent) {
+    lines.push(`${a.provider} deprecation page changed (${[...a.added.map(i => '+' + i), ...a.removed.map(i => '-' + i)].slice(0, 6).join(', ')}). Re-check dates: ${a.url}`);
+  }
+  return lines;
+}
+
+async function handleModelLifecycle(args, env) {
+  const q = (args?.model || '').toLowerCase();
+  const list = MODELS.filter(m => !q || m.model.includes(q));
+  return {
+    verified: MODELS_VERIFIED,
+    note: 'Dates are from each provider\'s page as checked on the verified date. Check the source before depending on one.',
+    alerts: await getModelAlerts(env),
+    models: list.map(m => ({
+      ...m,
+      days_left: m.retires ? daysUntil(m.retires) : (m.not_before ? daysUntil(m.not_before) : null),
+      source_url: MODEL_PAGES[m.provider],
+    })),
+  };
+}
+
 // Write tools need "Authorization: Bearer <SUNDIAL_WRITE_TOKEN>". Fails closed:
 // with no secret set, nobody can write. Read tools stay open as before.
 async function writeAuthorized(request, env) {
@@ -1389,6 +1511,12 @@ async function handleWorldState(args, env) {
     firedWatches = await getFiredWatches(env);
   } catch (e) {
     console.warn('[world_state] watches read failed:', e.message);
+  }
+  let modelAlerts = [];
+  try {
+    modelAlerts = await getModelAlerts(env);
+  } catch (e) {
+    console.warn('[world_state] model alerts failed:', e.message);
   }
 
   // Calculate sky state
@@ -1467,6 +1595,7 @@ async function handleWorldState(args, env) {
 
     // Only what's not fine; empty on a quiet day
     services: servicesDown,
+    models: modelAlerts,
 
     // I FEEL summary for Jace
     i_feel: {
@@ -1714,6 +1843,7 @@ async function executeTool(name, args, env) {
     case 'watch_add': return handleWatchAdd(args, env);
     case 'watch_list': return handleWatchList(args, env);
     case 'watch_remove': return handleWatchRemove(args, env);
+    case 'model_lifecycle': return handleModelLifecycle(args, env);
     default: return { error: `Unknown tool: ${name}` };
   }
 }
@@ -1946,7 +2076,7 @@ export default {
   // Failures log at error: a silent dead cron is how organs die here.
   async scheduled(event, env, ctx) {
     const job = event.cron === '0 22 * * *'
-      ? writeDailyNote(env)
+      ? Promise.all([writeDailyNote(env), checkModelPages(env)])
       : pollServiceStatus(env).then(({ services }) => evaluateWatches(env, services));
     ctx.waitUntil(job.catch(e => console.error(`[cron ${event.cron}] failed:`, e.message)));
   },
