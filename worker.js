@@ -494,6 +494,33 @@ const TOOLS = [
       },
     },
   },
+  {
+    name: 'watch_add',
+    description: 'Set a one-time watch ("tell me when..."). Checked every 30 min; when it fires it leads world_state and session_start for 24h, then drops. Kinds and params: heat {above_c}, cold {below_c}, rain {min_percent} (tomorrow), aqi {min_index 2-5}, date {date: YYYY-MM-DD, days_before}, service {service: anthropic|cloudflare|github|discord|digitalocean}. Max 20. Needs the write token.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        kind: { type: 'string', enum: ['heat', 'cold', 'rain', 'aqi', 'date', 'service'] },
+        params: { type: 'object', description: 'Kind-specific, see description.' },
+        label: { type: 'string', description: 'Optional plain-text name, up to 60 characters.' },
+      },
+      required: ['kind', 'params'],
+    },
+  },
+  {
+    name: 'watch_list',
+    description: 'List active watches and ones that fired in the last 24h.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'watch_remove',
+    description: 'Remove a watch by id (from watch_list). Needs the write token.',
+    inputSchema: {
+      type: 'object',
+      properties: { id: { type: 'string' } },
+      required: ['id'],
+    },
+  },
 ];
 
 // ─── Tool Handlers ──────────────────────────────────────────
@@ -567,7 +594,15 @@ async function handleSessionStart(args, env) {
     timestamp: now.toISOString(),
   }));
 
+  let firedWatches = [];
+  try {
+    firedWatches = await getFiredWatches(env);
+  } catch (e) {
+    console.warn('[session_start] watches read failed:', e.message);
+  }
+
   return {
+    fired_watches: firedWatches,
     ...timeData,
     session_started: now.toISOString(),
     gap: gap,
@@ -1111,7 +1146,7 @@ async function writeDailyNote(env) {
     temp_max: d.temperature_2m_max[0],
     rain_mm: d.precipitation_sum[0],
     cloud_pct: d.cloud_cover_mean[0],
-    aqi_6am: air?.aqi?.value ?? null,
+    aqi_6am: air?.aqi?.index ?? null, // OpenWeather 1 (good) .. 5 (very poor)
     service_events: log.filter(e => mytDate(new Date(e.at)) === date),
     morning_headline: newsR.status === 'fulfilled' ? (newsR.value.malaysia?.[0]?.title || null) : null,
     written_at: new Date().toISOString(),
@@ -1154,6 +1189,161 @@ async function handleWhatChanged(args, env) {
   return buildWhatChanged(days, env);
 }
 
+// ─── Watches (Sundial 2.2 phase C) ──────────────────────────
+// "Tell me once when...". Closed list of kinds, no free-form logic.
+// A watch fires once, stays visible for 24h in world_state/session_start,
+// then is dropped. Visibility is time-based, not "told" flags: the daemon
+// polls world_state too, and a background read must not swallow a watch
+// before Jace actually sees it.
+
+const WATCH_MAX = 20;
+const WATCH_VISIBLE_MS = 24 * 3600000;
+const WRITE_TOOLS = new Set(['watch_add', 'watch_remove']);
+
+const WATCH_KINDS = {
+  heat:    { params: { above_c: [20, 45] }, says: p => `hotter than ${p.above_c}°C in the next 48h` },
+  cold:    { params: { below_c: [-10, 30] }, says: p => `colder than ${p.below_c}°C in the next 48h` },
+  rain:    { params: { min_percent: [1, 100] }, says: p => `rain chance tomorrow at ${p.min_percent}% or more` },
+  aqi:     { params: { min_index: [2, 5] }, says: p => `air quality index ${p.min_index}+ (1 good .. 5 very poor)` },
+  date:    { params: { days_before: [0, 365] }, says: p => `${p.days_before} day(s) before ${p.date}` },
+  service: { params: {}, says: p => `${p.service} not operational` },
+};
+
+function validateWatch(kind, params, label) {
+  const spec = WATCH_KINDS[kind];
+  if (!spec) return `Unknown kind "${kind}". Use one of: ${Object.keys(WATCH_KINDS).join(', ')}`;
+  const clean = {};
+  for (const [key, [min, max]] of Object.entries(spec.params)) {
+    const v = Number(params?.[key]);
+    if (!Number.isFinite(v) || v < min || v > max) return `${kind} needs ${key} between ${min} and ${max}`;
+    clean[key] = v;
+  }
+  if (kind === 'date') {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(params?.date || '') || isNaN(Date.parse(params.date))) return 'date needs date as YYYY-MM-DD';
+    clean.date = params.date;
+  }
+  if (kind === 'service') {
+    if (!STATUS_PAGES[params?.service]) return `service must be one of: ${Object.keys(STATUS_PAGES).join(', ')}`;
+    clean.service = params.service;
+  }
+  if (label !== undefined && (typeof label !== 'string' || label.length > 60 || /[<>]/.test(label))) {
+    return 'label: plain text, up to 60 characters, no < or >';
+  }
+  return { params: clean };
+}
+
+async function handleWatchAdd(args, env) {
+  const v = validateWatch(args?.kind, args?.params || {}, args?.label);
+  if (typeof v === 'string') return { error: `Nothing was saved. ${v}` };
+  const watches = (await env.SUNDIAL_KV.get('watches', { type: 'json' })) || [];
+  if (watches.filter(w => !w.fired_at).length >= WATCH_MAX) return { error: `Nothing was saved. ${WATCH_MAX} active watches is the limit.` };
+  const watch = {
+    id: crypto.randomUUID().slice(0, 8),
+    kind: args.kind,
+    params: v.params,
+    label: args.label || WATCH_KINDS[args.kind].says(v.params),
+    created: new Date().toISOString(),
+    fired_at: null,
+    fired_detail: null,
+  };
+  await env.SUNDIAL_KV.put('watches', JSON.stringify([...watches, watch]));
+  return { status: 'added', watch, watching_for: WATCH_KINDS[watch.kind].says(watch.params) };
+}
+
+async function handleWatchList(args, env) {
+  const watches = (await env.SUNDIAL_KV.get('watches', { type: 'json' })) || [];
+  return {
+    active: watches.filter(w => !w.fired_at),
+    fired: watches.filter(w => w.fired_at),
+    limit: WATCH_MAX,
+  };
+}
+
+async function handleWatchRemove(args, env) {
+  const watches = (await env.SUNDIAL_KV.get('watches', { type: 'json' })) || [];
+  const keep = watches.filter(w => w.id !== args?.id);
+  if (keep.length === watches.length) return { error: `No watch with id "${args?.id}". Use watch_list.` };
+  await env.SUNDIAL_KV.put('watches', JSON.stringify(keep));
+  return { status: 'removed', id: args.id };
+}
+
+// Cron path (every 30 min, after the status poll). One Open-Meteo fetch,
+// only when a weather watch is waiting. One KV write, only when something
+// fires or expires.
+async function evaluateWatches(env, services) {
+  const watches = (await env.SUNDIAL_KV.get('watches', { type: 'json' })) || [];
+  if (!watches.length) return { fired: 0 };
+  const now = Date.now();
+  const pending = watches.filter(w => !w.fired_at);
+
+  let forecast = null;
+  if (pending.some(w => ['heat', 'cold', 'rain'].includes(w.kind))) {
+    const url = `https://api.open-meteo.com/v1/forecast?latitude=${LOCATION.lat}&longitude=${LOCATION.lon}` +
+      `&hourly=temperature_2m&daily=precipitation_probability_max&forecast_days=3` +
+      `&timezone=${encodeURIComponent(DEFAULT_TIMEZONE)}`;
+    try {
+      forecast = await (await fetchWithTimeout(url, {}, 6000)).json();
+    } catch (e) {
+      console.error('[watches] forecast fetch failed:', e.message);
+    }
+  }
+  const temps48 = forecast?.hourly?.temperature_2m?.slice(0, 48) || [];
+  const today = mytDate(new Date(now));
+  const tomorrow = mytDate(new Date(now + 86400000));
+  const rainTomorrow = forecast?.daily?.time
+    ? forecast.daily.precipitation_probability_max[forecast.daily.time.indexOf(tomorrow)] : null;
+
+  let airIndex = null;
+  if (pending.some(w => w.kind === 'aqi')) {
+    const air = await handleGetAirQuality({}, env).catch(() => null);
+    airIndex = air?.aqi?.index ?? null;
+  }
+
+  let changed = false;
+  for (const w of pending) {
+    const p = w.params;
+    let detail = null;
+    if (w.kind === 'heat' && temps48.length && Math.max(...temps48) > p.above_c) detail = `forecast high ${Math.max(...temps48)}°C`;
+    if (w.kind === 'cold' && temps48.length && Math.min(...temps48) < p.below_c) detail = `forecast low ${Math.min(...temps48)}°C`;
+    if (w.kind === 'rain' && rainTomorrow != null && rainTomorrow >= p.min_percent) detail = `${rainTomorrow}% rain chance tomorrow`;
+    if (w.kind === 'aqi' && airIndex != null && airIndex >= p.min_index) detail = `air quality index ${airIndex}`;
+    if (w.kind === 'date') {
+      const daysLeft = Math.round((Date.parse(p.date) - Date.parse(today)) / 86400000);
+      if (daysLeft <= p.days_before && daysLeft >= -1) detail = daysLeft === 0 ? 'today' : `${daysLeft} day(s) to go`;
+    }
+    if (w.kind === 'service') {
+      const s = services?.[p.service];
+      if (s && s.state !== 'operational' && s.state !== 'unknown') detail = `${s.state}${s.incident ? `: ${s.incident}` : ''}`;
+    }
+    if (detail) { w.fired_at = new Date(now).toISOString(); w.fired_detail = detail; changed = true; }
+  }
+  const kept = watches.filter(w => !w.fired_at || now - Date.parse(w.fired_at) < WATCH_VISIBLE_MS);
+  if (changed || kept.length !== watches.length) {
+    await env.SUNDIAL_KV.put('watches', JSON.stringify(kept));
+  }
+  return { fired: pending.filter(w => w.fired_at).length };
+}
+
+async function getFiredWatches(env) {
+  const watches = (await env.SUNDIAL_KV.get('watches', { type: 'json' })) || [];
+  const now = Date.now();
+  return watches
+    .filter(w => w.fired_at && now - Date.parse(w.fired_at) < WATCH_VISIBLE_MS)
+    .map(w => `${w.label}: ${w.fired_detail}`);
+}
+
+// Write tools need "Authorization: Bearer <SUNDIAL_WRITE_TOKEN>". Fails closed:
+// with no secret set, nobody can write. Read tools stay open as before.
+async function writeAuthorized(request, env) {
+  const expected = env.SUNDIAL_WRITE_TOKEN;
+  if (!expected) return false;
+  const got = (request.headers.get('Authorization') || '').replace(/^Bearer\s+/i, '');
+  const enc = new TextEncoder();
+  const a = enc.encode(got), b = enc.encode(expected);
+  if (a.byteLength !== b.byteLength) return false;
+  return crypto.subtle.timingSafeEqual(a, b);
+}
+
 async function handleWorldState(args, env) {
   const now = new Date();
   const timeData = getTimeInZone(DEFAULT_TIMEZONE);
@@ -1194,6 +1384,12 @@ async function handleWorldState(args, env) {
   } catch (e) {
     console.warn('[world_state] status read failed:', e.message);
   }
+  let firedWatches = [];
+  try {
+    firedWatches = await getFiredWatches(env);
+  } catch (e) {
+    console.warn('[world_state] watches read failed:', e.message);
+  }
 
   // Calculate sky state
   const colors = getTimeOfDayColors(hour);
@@ -1230,6 +1426,9 @@ async function handleWorldState(args, env) {
   }
 
   return {
+    // Fired watches lead (empty on a quiet day)
+    fired_watches: firedWatches,
+
     timestamp: now.toISOString(),
     location: LOCATION.city,
 
@@ -1512,6 +1711,9 @@ async function executeTool(name, args, env) {
     case 'world_headline': return handleWorldHeadline(args, env);
     case 'service_status': return handleServiceStatus(args, env);
     case 'what_changed': return handleWhatChanged(args, env);
+    case 'watch_add': return handleWatchAdd(args, env);
+    case 'watch_list': return handleWatchList(args, env);
+    case 'watch_remove': return handleWatchRemove(args, env);
     default: return { error: `Unknown tool: ${name}` };
   }
 }
@@ -1559,6 +1761,12 @@ async function handleMCP(request, env) {
     case 'tools/call': {
       const toolName = params?.name;
       const toolArgs = params?.arguments || {};
+      if (WRITE_TOOLS.has(toolName) && !(await writeAuthorized(request, env))) {
+        return jsonRpcResponse(id, {
+          isError: true,
+          content: [{ type: 'text', text: `${toolName} needs Sundial's write token (Authorization: Bearer ...). Nothing was changed.` }],
+        });
+      }
       const result = await executeTool(toolName, toolArgs, env);
 
       // If tool returns content array directly (visual tools), use it as-is
@@ -1603,7 +1811,7 @@ export default {
     const corsHeaders = {
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
     };
 
     // Handle preflight
@@ -1737,7 +1945,9 @@ export default {
   // Crons (wrangler.toml): status every 30 min, daily note 22:00 UTC = 06:00 MYT.
   // Failures log at error: a silent dead cron is how organs die here.
   async scheduled(event, env, ctx) {
-    const job = event.cron === '0 22 * * *' ? writeDailyNote(env) : pollServiceStatus(env);
+    const job = event.cron === '0 22 * * *'
+      ? writeDailyNote(env)
+      : pollServiceStatus(env).then(({ services }) => evaluateWatches(env, services));
     ctx.waitUntil(job.catch(e => console.error(`[cron ${event.cron}] failed:`, e.message)));
   },
 };
