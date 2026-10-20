@@ -955,12 +955,18 @@ async function fetchNewsFromRSS(url, cacheKey, sourceName, env, timeoutMs = 2500
     }
   }
 
+  // Oct 20 2026: a slow feed used to return [] while good headlines sat in
+  // the cache, so World Bridge showed an empty News card. Stale beats empty.
+  const stale = (error) => cached?.headlines?.length
+    ? { headlines: cached.headlines, cached: true, stale: true, error }
+    : { headlines: [], error };
+
   try {
     const response = await fetchWithTimeout(url, {
       headers: { 'User-Agent': 'Mozilla/5.0 (compatible; WorldBridge/1.0)' }
-    });
+    }, timeoutMs);
 
-    if (!response.ok) return { headlines: [], error: `Fetch failed: ${response.status}` };
+    if (!response.ok) return stale(`Fetch failed: ${response.status}`);
 
     const xml = await response.text();
     const headlines = [];
@@ -992,10 +998,45 @@ async function fetchNewsFromRSS(url, cacheKey, sourceName, env, timeoutMs = 2500
       }));
     }
 
+    if (!headlines.length) return stale('feed returned no items');
     return { headlines, cached: false };
   } catch (e) {
-    return { headlines: [], error: e.message };
+    return stale(e.message);
   }
+}
+
+// Today's shape for World Bridge: high/low and when rain is likely.
+// Open-Meteo via the edge cache (30 min), so no KV writes and the daemon's
+// frequent /world reads don't hammer the API.
+async function getTodayForecast() {
+  const url = `https://api.open-meteo.com/v1/forecast?latitude=${LOCATION.lat}&longitude=${LOCATION.lon}` +
+    `&hourly=precipitation_probability&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max` +
+    `&forecast_days=2&timezone=${encodeURIComponent(DEFAULT_TIMEZONE)}`;
+  const cache = caches.default;
+  let res = await cache.match(url);
+  if (!res) {
+    const live = await fetchWithTimeout(url, {}, 4000);
+    if (!live.ok) throw new Error(`open-meteo ${live.status}`);
+    res = new Response(await live.text(), { headers: { 'Cache-Control': 'max-age=1800', 'Content-Type': 'application/json' } });
+    await cache.put(url, res.clone());
+  }
+  const j = await res.json();
+  const today = mytDate(new Date());
+  const hourNow = parseInt(new Intl.DateTimeFormat('en-US', { timeZone: DEFAULT_TIMEZONE, hour: 'numeric', hour12: false }).format(new Date())) % 24;
+  const startIdx = j.hourly.time.indexOf(`${today}T${String(hourNow).padStart(2, '0')}:00`);
+  const ahead = startIdx >= 0 ? j.hourly.time.slice(startIdx, startIdx + 12).map((t, i) => ({ t, p: j.hourly.precipitation_probability[startIdx + i] })) : [];
+  const wet = ahead.find(h => h.p >= 50);
+  const di = j.daily.time.indexOf(today);
+  const fmtHour = t => new Date(`${t}:00+08:00`).toLocaleTimeString('en-US', { hour: 'numeric', hour12: true, timeZone: DEFAULT_TIMEZONE });
+  return {
+    high: j.daily.temperature_2m_max[di],
+    low: j.daily.temperature_2m_min[di],
+    rain_chance_today: j.daily.precipitation_probability_max[di],
+    next_rain: wet ? { around: fmtHour(wet.t), chance: wet.p } : null,
+    rain_line: wet
+      ? (wet.t === ahead[0]?.t ? `Rain likely now (${wet.p}%)` : `Rain likely around ${fmtHour(wet.t)} (${wet.p}%)`)
+      : `No rain expected in the next 12h`,
+  };
 }
 
 async function handleGetNews(args, env) {
@@ -1368,7 +1409,8 @@ const MODELS = [
   { model: 'claude-opus-5', provider: 'anthropic', status: 'active', not_before: '2027-07-24', used_by: 'claude-lane menu' },
   { model: 'claude-opus-5-5', provider: 'anthropic', status: 'active', not_before: '2027-09-22', used_by: 'claude-lane menu; Claude Code' },
   { model: 'claude-haiku-5-5', provider: 'anthropic', status: 'active', not_before: '2027-10-07', used_by: 'dream writer (02:10)' },
-  { model: 'llama-3.3-70b-versatile', provider: 'groq', status: 'retired', retires: '2026-08-16', replacement: 'openai/gpt-oss-120b (production; qwen3.6-27b also gone 2026-09-14)', used_by: 'Lighthouse LIGHTHOUSE_GROQ_MODEL' },
+  // llama-3.3-70b-versatile (retired 2026-08-16) left Lighthouse Oct 19 (lighthouse 718ecff -> gpt-oss-120b).
+  { model: 'openai/gpt-oss-120b', provider: 'groq', status: 'active', used_by: 'Lighthouse Groq fallback (since Oct 19)' },
   { model: 'deepseek-chat', provider: 'deepseek', status: 'retired', retires: '2026-07-24', replacement: 'deepseek-v4-flash', used_by: 'ANIMUS felt_reader id map; Hermes resident-config' },
   { model: 'deepseek-v4-pro', provider: 'deepseek', status: 'active', used_by: 'ANIMUS model / model_pro' },
   { model: 'deepseek-v4-flash', provider: 'deepseek', status: 'active', used_by: 'ANIMUS model_flash' },
@@ -1396,6 +1438,20 @@ function modelLine(m) {
     return `${m.model}: guaranteed only until ${m.not_before} (${daysUntil(m.not_before)} days) - ${m.used_by}.`;
   }
   return null;
+}
+
+// One short phrase per model worth a glance, for World Bridge chips.
+function modelBrief(m) {
+  const short = m.model.replace(/^claude-/, '');
+  if (m.status === 'retired') return `${short}: retired, still referenced`;
+  if (m.retires) return `${short}: retires ${fmtShortDate(m.retires)} (${daysUntil(m.retires)}d)`;
+  if (m.not_before && daysUntil(m.not_before) <= 0) return `${short}: may retire any time`;
+  if (m.not_before && daysUntil(m.not_before) <= 60) return `${short}: safe until ${fmtShortDate(m.not_before)}`;
+  return null;
+}
+
+function fmtShortDate(d) {
+  return new Date(`${d}T00:00:00+08:00`).toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: DEFAULT_TIMEZONE });
 }
 
 // Daily cron. Fails per provider, never all at once.
@@ -1518,6 +1574,9 @@ async function handleWorldState(args, env) {
   } catch (e) {
     console.warn('[world_state] model alerts failed:', e.message);
   }
+  const [todayR, weekR] = await Promise.allSettled([getTodayForecast(), buildWhatChanged(7, env)]);
+  if (todayR.status === 'rejected') console.warn('[world_state] today forecast failed:', todayR.reason?.message);
+  if (weekR.status === 'rejected') console.warn('[world_state] week summary failed:', weekR.reason?.message);
 
   // Calculate sky state
   const colors = getTimeOfDayColors(hour);
@@ -1596,6 +1655,11 @@ async function handleWorldState(args, env) {
     // Only what's not fine; empty on a quiet day
     services: servicesDown,
     models: modelAlerts,
+    models_brief: MODELS.map(modelBrief).filter(Boolean),
+
+    // World Bridge: today's shape + the week from daily notes
+    today: todayR.status === 'fulfilled' ? todayR.value : null,
+    week: weekR.status === 'fulfilled' ? { lines: weekR.value.lines, notes: weekR.value.notes } : null,
 
     // I FEEL summary for Jace
     i_feel: {
