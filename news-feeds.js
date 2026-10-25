@@ -22,6 +22,7 @@ export const NEWS_MAX_LIMIT = 30;
 export const NEWS_MAX_DAYS = 7;
 export const SUMMARY_CAP = 300;
 const TITLE_CAP = 200;
+const THIN_SUMMARY = 40;
 const WINDOW_MS = NEWS_MAX_DAYS * 86400000;
 const FETCH_TIMEOUT_MS = 6000;
 const STALE_AFTER_MS = 2 * 3600000;      // a feed not refreshed for 2h reads as stale
@@ -33,6 +34,8 @@ export const NEWS_LOCAL_KEY = 'news_local_v1';
 
 // Every URL here was fetched on Oct 25 2026 and returned live RSS/Atom.
 // The Star (all /rss paths 404) and Daily Express Sabah (403, no feed) were not.
+// BleepingComputer was live from the Dell but 403s Cloudflare; removed on his
+// word (Oct 25): a feed that is always red teaches him to skim past problems.
 export const NEWS_FEEDS = [
   { id: 'verge_ai', section: 'ai', name: 'The Verge AI', url: 'https://www.theverge.com/rss/ai-artificial-intelligence/index.xml' },
   { id: 'simon_willison', section: 'ai', name: 'Simon Willison', url: 'https://simonwillison.net/atom/everything/' },
@@ -42,7 +45,6 @@ export const NEWS_FEEDS = [
   { id: 'alignment_forum', section: 'research', name: 'Alignment Forum', url: 'https://www.alignmentforum.org/feed.xml' },
   { id: 'mycert', section: 'security', name: 'MyCERT', url: 'https://www.mycert.org.my/portal/rss' },
   { id: 'the_hacker_news', section: 'security', name: 'The Hacker News', url: 'https://feeds.feedburner.com/TheHackersNews' },
-  { id: 'bleepingcomputer', section: 'security', name: 'BleepingComputer', url: 'https://www.bleepingcomputer.com/feed/' },
   // The house is in Kota Kinabalu: the Sabah feed leads the wake headlines.
   { id: 'borneo_post_sabah', section: 'malaysia', name: 'Borneo Post (Sabah)', url: 'https://www.theborneopost.com/category/news/sabah/feed/', local: true },
   { id: 'malaysiakini', section: 'malaysia', name: 'Malaysiakini', url: 'https://www.malaysiakini.com/rss/en/news.rss' },
@@ -158,7 +160,16 @@ export function parseFeed(xml) {
   for (const b of blocks) {
     const title = plainText(getTag(b, ['title']), TITLE_CAP);
     if (!title) continue;
-    const summary = plainText(getTag(b, ['description', 'summary', 'content:encoded', 'content']), SUMMARY_CAP);
+    let summary = plainText(getTag(b, ['description', 'summary', 'content:encoded', 'content']), SUMMARY_CAP);
+    if (summary.length < THIN_SUMMARY) {
+      // Import AI's description is "What do you think?". Substack puts the post in
+      // content:encoded after a "Welcome... Subscribe now" block; skip that block.
+      let body = plainText(getTag(b, ['content:encoded', 'content']), 2000);
+      const promo = body.match(/^[\s\S]{0,400}?\bSubscribe now\s+/);
+      if (promo) body = body.slice(promo[0].length);
+      body = plainText(body, SUMMARY_CAP);
+      if (body.length > summary.length) summary = body;
+    }
     items.push({ title, link: getLink(b), published: getDate(b, summary), summary });
   }
   return items;
@@ -170,7 +181,9 @@ const itemKey = (it) => it.link || `t:${it.title.toLowerCase()}`;
 
 export function mergeFeed(prevItems, freshItems, feed, now) {
   const max = feed.max || 50;
-  const keep = feed.keep || 60;
+  // keep: enough for a week of a busy outlet (NST/FMT/Malay Mail post ~50+/day).
+  // Was 60, which quietly made days=7 mean "about a day" for them (his catch).
+  const keep = feed.keep || 500;
   const fresh = (freshItems || []).slice(0, max);
   const prevByKey = new Map((prevItems || []).map((it) => [itemKey(it), it]));
   const nowIso = new Date(now).toISOString();
@@ -290,9 +303,14 @@ export function feedHealth(store, now, feeds = NEWS_FEEDS) {
     let line = null;
     if (state === 'stale') line = `${f.name} ${s.error ? `down (${s.error})` : 'not refreshed'}, cached ${ageText(age_minutes)} ago`;
     if (state === 'failed') line = `${f.name} down (${s.error || 'no data'}), nothing cached`;
+    const items = s.items || [];
+    const oldest = items.length ? Date.parse(items[items.length - 1].published) : null;
     return {
       id: f.id, name: f.name, section: f.section, state,
-      items_cached: s.items?.length || 0,
+      items_cached: items.length,
+      // How far back this feed's cache reaches, so a short window is visible
+      // instead of assumed to be a week.
+      covers_hours: oldest == null ? null : Math.max(0, Math.round((now - oldest) / 3600000)),
       last_ok: s.last_ok, age_minutes, error: s.error || null, line,
     };
   });
@@ -348,12 +366,29 @@ export function readNews(store, rawArgs, now = Date.now(), feeds = NEWS_FEEDS) {
   return {
     section: a.section, days: a.days, query: a.query, limit: a.limit,
     total_matches: matches.length,
-    items: matches.slice(0, a.limit),
+    items: a.query ? matches.slice(0, a.limit) : fairPage(matches, a.limit),
     feeds: health,
     problems: health.filter((h) => h.line).map((h) => h.line),
     refreshed_at: store?.refreshed_at || null,
     note: FEED_TEXT_NOTE,
   };
+}
+
+// Without a query, newest-first lets the outlet that posts most fill the page
+// (NST took 6 of 10). His fix: at most 3 per source on the page, newest first;
+// only if that leaves the page short do the extras fill in.
+export const PER_SOURCE_ON_PAGE = 3;
+export function fairPage(sorted, limit) {
+  const count = new Map();
+  const page = [];
+  const extra = [];
+  for (const it of sorted) {
+    const n = count.get(it.source) || 0;
+    if (n < PER_SOURCE_ON_PAGE) { count.set(it.source, n + 1); page.push(it); } else extra.push(it);
+    if (page.length >= limit) break;
+  }
+  return [...page, ...extra.slice(0, Math.max(0, limit - page.length))]
+    .sort((x, y) => Date.parse(y.published) - Date.parse(x.published));
 }
 
 // Wake headlines: 2-3 Malaysia items, the Sabah feed first if it has something

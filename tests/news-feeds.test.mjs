@@ -7,7 +7,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   plainText, parseFeed, mergeFeed, refreshNews, readNews, getNewsStore,
-  localHeadlines, validateNewsArgs, NEWS_FEEDS, NEWS_STORE_KEY, NEWS_LOCAL_KEY, _resetInlineBackoff,
+  localHeadlines, validateNewsArgs, NEWS_FEEDS, NEWS_STORE_KEY, NEWS_LOCAL_KEY, _resetInlineBackoff, mergeFeed as merge,
 } from '../news-feeds.js';
 import worker from '../worker.js';
 
@@ -71,12 +71,12 @@ test('parseFeed reads Atom entries with href links', () => {
   const xml = `<feed xmlns="http://www.w3.org/2005/Atom"><title>Blog</title>
     <entry><title type="html">A &amp;amp; B</title><link rel="alternate" type="text/html" href="https://simonwillison.net/x/"/>
     <id>tag:x</id><published>2026-10-24T03:59:57+00:00</published><updated>2026-10-24T05:00:00+00:00</updated>
-    <summary type="html">&lt;p&gt;Short&lt;/p&gt;</summary><content type="html">&lt;p&gt;Long body&lt;/p&gt;</content></entry></feed>`;
+    <summary type="html">&lt;p&gt;A short summary that is still over forty characters.&lt;/p&gt;</summary><content type="html">&lt;p&gt;Long body&lt;/p&gt;</content></entry></feed>`;
   const [it] = parseFeed(xml);
   assert.equal(it.title, 'A & B');
   assert.equal(it.link, 'https://simonwillison.net/x/');
   assert.equal(it.published, '2026-10-24T03:59:57.000Z');
-  assert.equal(it.summary, 'Short');
+  assert.equal(it.summary, 'A short summary that is still over forty characters.');
 });
 
 test('parseFeed rejects non-http links', () => {
@@ -293,6 +293,60 @@ test('localHeadlines: Sabah first, one per source, at most 3, last 36h only', ()
   const out = localHeadlines(s, NOW, FEEDS);
   assert.deepEqual(out.map((i) => i.source), ['Borneo Post (Sabah)', 'Malaysiakini', 'Free Malaysia Today']);
   assert.ok(out.length <= 3);
+});
+
+// ─── his try-out notes (Oct 25 22:05) ──────────────────────
+
+test('BleepingComputer is out (403s Cloudflare; his call)', () => {
+  assert.ok(!NEWS_FEEDS.some((f) => /bleeping/i.test(f.url)));
+  assert.deepEqual(NEWS_FEEDS.filter((f) => f.section === 'security').map((f) => f.id), ['mycert', 'the_hacker_news']);
+});
+
+test('without a query, at most 3 per source on the page; a query stays newest-first', () => {
+  const feeds = [
+    { id: 'nst', section: 'malaysia', name: 'NST' },
+    { id: 'mk', section: 'malaysia', name: 'Malaysiakini' },
+    { id: 'mm', section: 'malaysia', name: 'Malay Mail' },
+  ];
+  const mk = (src, n, startH) => Array.from({ length: n }, (_, i) => ({ title: `${src} story ${i}`, link: `https://${src}/${i}`, published: iso(NOW - (startH + i * 0.1) * H), summary: '' }));
+  const store = { refreshed_at: iso(NOW), feeds: {
+    nst: { last_ok: iso(NOW), items: mk('nst', 20, 0) },
+    mk: { last_ok: iso(NOW), items: mk('mk', 5, 5) },
+    mm: { last_ok: iso(NOW), items: mk('mm', 5, 6) },
+  } };
+  const page = readNews(store, { section: 'malaysia', limit: 10 }, NOW, feeds).items;
+  const per = page.reduce((m, i) => ({ ...m, [i.source]: (m[i.source] || 0) + 1 }), {});
+  assert.equal(page.length, 10);
+  assert.ok(per.NST <= 4 && per.Malaysiakini >= 3 && per['Malay Mail'] >= 3, JSON.stringify(per));
+  assert.ok(page.every((it, i) => i === 0 || Date.parse(page[i - 1].published) >= Date.parse(it.published)), 'still newest first');
+  const q = readNews(store, { section: 'malaysia', limit: 10, query: 'story' }, NOW, feeds).items;
+  assert.equal(q.filter((i) => i.source === 'NST').length, 10, 'a query is not rebalanced');
+  const one = readNews({ refreshed_at: iso(NOW), feeds: { nst: { last_ok: iso(NOW), items: mk('nst', 20, 0) } } }, { section: 'malaysia', limit: 10 }, NOW, feeds).items;
+  assert.equal(one.length, 10, 'a lone source still fills the page');
+});
+
+test('a busy feed keeps a real week (not 60 items), and health says how far back it reaches', () => {
+  const feed = { id: 'nst' };
+  let items = [];
+  for (let d = 6; d >= 0; d--) {
+    const fresh = Array.from({ length: 50 }, (_, i) => ({ title: `d${d} i${i}`, link: `https://nst/${d}/${i}`, published: iso(NOW - d * 24 * H - i * 0.4 * H), summary: '' }));
+    items = merge(items, fresh, feed, NOW - d * 24 * H + 1);
+  }
+  assert.ok(items.length > 300, String(items.length));
+  const store = { refreshed_at: iso(NOW), feeds: { nst: { last_ok: iso(NOW), error: null, items } } };
+  const [h] = readNews(store, { section: 'malaysia' }, NOW, [{ id: 'nst', section: 'malaysia', name: 'NST' }]).feeds;
+  assert.ok(h.covers_hours >= 6 * 24, String(h.covers_hours));
+});
+
+test('a thin summary falls back to the post body, Substack promo skipped', () => {
+  const xml = `<rss><channel><item><title>Import AI 477</title><link>https://importai.substack.com/p/477</link>
+    <pubDate>Mon, 19 Oct 2026 12:31:37 GMT</pubDate><description><![CDATA[What do you think?]]></description>
+    <content:encoded><![CDATA[<p>Welcome to Import AI, a newsletter about AI research. Please subscribe.</p><p class="button-wrapper"><a><span>Subscribe now</span></a></p><p>Here is a speech I gave at the IMF.</p>]]></content:encoded></item>
+    <item><title>Fine</title><link>https://x/2</link><pubDate>Mon, 19 Oct 2026 12:31:37 GMT</pubDate><description>A perfectly good summary that is long enough to keep.</description>
+    <content:encoded><![CDATA[<p>Body that should not replace it.</p>]]></content:encoded></item></channel></rss>`;
+  const [a, b] = parseFeed(xml);
+  assert.equal(a.summary, 'Here is a speech I gave at the IMF.');
+  assert.equal(b.summary, 'A perfectly good summary that is long enough to keep.');
 });
 
 // ─── seams: the worker ─────────────────────────────────────
