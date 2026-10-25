@@ -7,7 +7,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   plainText, parseFeed, mergeFeed, refreshNews, readNews, getNewsStore,
-  localHeadlines, validateNewsArgs, NEWS_FEEDS, NEWS_STORE_KEY, NEWS_LOCAL_KEY,
+  localHeadlines, validateNewsArgs, NEWS_FEEDS, NEWS_STORE_KEY, NEWS_LOCAL_KEY, _resetInlineBackoff,
 } from '../news-feeds.js';
 import worker from '../worker.js';
 
@@ -200,6 +200,7 @@ test('a feed the cron has not refreshed for over 2h reads as stale even without 
 });
 
 test('getNewsStore refreshes inline when the cron has gone quiet, otherwise only reads', async () => {
+  _resetInlineBackoff();
   const fresh = fakeKV({ [NEWS_STORE_KEY]: { v: 1, refreshed_at: iso(NOW - 10 * 60000), feeds: {} } });
   let calls = 0;
   const f = async () => { calls++; return new Response(rss([]), { status: 200 }); };
@@ -210,6 +211,23 @@ test('getNewsStore refreshes inline when the cron has gone quiet, otherwise only
   await getNewsStore({ SUNDIAL_KV: dead }, { now: NOW, fetchImpl: f });
   assert.equal(calls, NEWS_FEEDS.length);
   assert.deepEqual(dead.writes, [NEWS_STORE_KEY, NEWS_LOCAL_KEY]);
+});
+
+test('getNewsStore backs off when KV puts keep failing (no refetch storm)', async () => {
+  _resetInlineBackoff();
+  const kv = fakeKV({ [NEWS_STORE_KEY]: { v: 1, refreshed_at: iso(NOW - 3 * H), feeds: {} } });
+  kv.put = async () => { throw new Error('KV put failed'); };
+  let calls = 0;
+  const f = async () => { calls++; return new Response(rss([]), { status: 200 }); };
+  const s1 = await getNewsStore({ SUNDIAL_KV: kv }, { now: NOW, fetchImpl: f });
+  assert.equal(calls, NEWS_FEEDS.length, 'first read tries once');
+  assert.equal(s1.refreshed_at, iso(NOW - 3 * H), 'serves the old store');
+  await getNewsStore({ SUNDIAL_KV: kv }, { now: NOW + 60000, fetchImpl: f });
+  await getNewsStore({ SUNDIAL_KV: kv }, { now: NOW + 5 * 60000, fetchImpl: f });
+  assert.equal(calls, NEWS_FEEDS.length, 'no refetch inside 10 min');
+  await getNewsStore({ SUNDIAL_KV: kv }, { now: NOW + 11 * 60000, fetchImpl: f });
+  assert.equal(calls, 2 * NEWS_FEEDS.length, 'tries again after the backoff');
+  _resetInlineBackoff();
 });
 
 // ─── reading ───────────────────────────────────────────────
@@ -314,6 +332,25 @@ test('seam: MCP lists read_news and calls it', async () => {
   assert.deepEqual(tool.inputSchema.properties.section.enum, ['ai', 'research', 'security', 'malaysia', 'world', 'all']);
   const call = await rpc({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'read_news', arguments: { section: 'world' } } });
   assert.match(JSON.stringify(call.result), /Live BBC item/);
+});
+
+test('seam: /world drops news.local older than 6h so the daemon falls back (Jace review)', async () => {
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async () => { throw new Error('offline in test'); };
+  try {
+    const env = seededEnv();
+    const old = JSON.parse(env.SUNDIAL_KV.data.get(NEWS_LOCAL_KEY));
+    old.refreshed_at = new Date(Date.now() - 7 * H).toISOString();
+    env.SUNDIAL_KV.data.set(NEWS_LOCAL_KEY, JSON.stringify(old));
+    const body = await (await worker.fetch(new Request('https://s/world'), env)).json();
+    assert.deepEqual(body.news.local, []);
+    old.refreshed_at = new Date(Date.now() - 5 * H).toISOString();
+    env.SUNDIAL_KV.data.set(NEWS_LOCAL_KEY, JSON.stringify(old));
+    const body2 = await (await worker.fetch(new Request('https://s/world'), env)).json();
+    assert.equal(body2.news.local.length, 1, 'under 6h is still served');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
 });
 
 test('seam: /world carries news.local for the wake context', async () => {

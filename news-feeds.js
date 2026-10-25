@@ -247,11 +247,20 @@ export async function refreshNews(env, { fetchImpl = fetch, now = Date.now(), fe
 
 // The reader's path. Normally a single KV read; if the cron has missed two runs
 // (or never ran) the reader refreshes inline so a dead cron cannot freeze news.
+// Backoff (Jace's review): if KV puts fail, refreshed_at never moves, and every
+// read would refetch all 15 feeds. One inline attempt per isolate per 10 min
+// while an old store exists to serve.
+const INLINE_BACKOFF_MS = 10 * 60000;
+let lastInlineAttempt = -Infinity;
+export function _resetInlineBackoff() { lastInlineAttempt = -Infinity; }
+
 export async function getNewsStore(env, { fetchImpl = fetch, now = Date.now() } = {}) {
   let store = null;
   try { store = await env.SUNDIAL_KV.get(NEWS_STORE_KEY, { type: 'json' }); } catch { store = null; }
   const age = store?.refreshed_at ? now - Date.parse(store.refreshed_at) : Infinity;
-  if (!store || !(age < INLINE_REFRESH_MS)) {
+  const backingOff = store && now - lastInlineAttempt < INLINE_BACKOFF_MS;
+  if ((!store || !(age < INLINE_REFRESH_MS)) && !backingOff) {
+    lastInlineAttempt = now;
     try {
       store = await refreshNews(env, { fetchImpl, now });
     } catch (e) {

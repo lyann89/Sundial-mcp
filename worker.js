@@ -12,6 +12,8 @@
 
 import { NEWS_SECTION_ARGS, NEWS_MAX_LIMIT, NEWS_MAX_DAYS, NEWS_LOCAL_KEY, getNewsStore, readNews, refreshNews } from './news-feeds.js';
 
+const NEWS_LOCAL_MAX_AGE_MS = 6 * 3600000;
+
 const DEFAULT_TIMEZONE = 'Asia/Kuala_Lumpur';
 
 // ─── Location: Kota Kinabalu, Sabah ─────────────────────────
@@ -1593,9 +1595,14 @@ async function handleWorldState(args, env) {
   }
   // Direct Malaysia headlines for his wake context (Sabah first). Written by the
   // news cron; empty until the first refresh, and the daemon falls back then.
+  // Jace's review fix: older than 6h means the cron or KV writes died; send
+  // nothing so the daemon falls back instead of showing Thursday as tonight.
   let localNews = [];
   try {
-    localNews = (await env.SUNDIAL_KV.get(NEWS_LOCAL_KEY, { type: 'json' }))?.items || [];
+    const local = await env.SUNDIAL_KV.get(NEWS_LOCAL_KEY, { type: 'json' });
+    const age = local?.refreshed_at ? Date.now() - Date.parse(local.refreshed_at) : Infinity;
+    if (age <= NEWS_LOCAL_MAX_AGE_MS) localNews = local.items || [];
+    else if (local) console.warn(`[world_state] local news is ${Math.round(age / 3600000)}h old, not served`);
   } catch (e) {
     console.warn('[world_state] local news read failed:', e.message);
   }
@@ -2203,8 +2210,9 @@ export default {
       : pollServiceStatus(env).then(({ services }) => evaluateWatches(env, services));
     ctx.waitUntil(job.catch(e => console.error(`[cron ${event.cron}] failed:`, e.message)));
     // News feeds ride the */30 cron on their own promise: a status-page failure
-    // must not stop the news refresh, and the reverse.
-    if (event.cron !== '0 22 * * *') {
+    // must not stop the news refresh, and the reverse. Named exactly, so a cron
+    // added later does not refresh news by accident (Jace's review).
+    if (event.cron === '*/30 * * * *') {
       ctx.waitUntil(refreshNews(env).catch(e => console.error('[cron news] failed:', e.message)));
     }
   },
